@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(curl -s \"https://app.redpepper.digital/client/4573/catalogues/json?_format=json\" -H \"User-Agent: Mozilla/5.0\" -H \"Accept: application/json\" -H \"Referer: https://app.redpepper.digital/a10/publications/home/4573\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\tbyer\\\\grocery circular list\" -Recurse -Filter \"*.py\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(.\\\\.venv\\\\Scripts\\\\pip.exe install *)",
+      "PowerShell(& \"c:\\\\Users\\\\tbyer\\\\grocery circular list\\\\.venv\\\\Scripts\\\\pip.exe\" install python-dotenv --quiet)",
+      "Bash(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import backend.app.adapters.vision_extractor\")",
+      "PowerShell(Invoke-WebRequest -Uri \"http://localhost:8000/api/health\" -TimeoutSec 5 -UseBasicParsing 2>&1)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(Start-Sleep -Seconds 65)",
+      "Bash(python -c \"import pdfplumber; print\\('ok'\\)\")"
+    ]
+  }
+}

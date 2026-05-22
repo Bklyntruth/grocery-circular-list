@@ -1,0 +1,17 @@
+{
+  "name": "Grocery Circular List",
+  "short_name": "Circulars",
+  "description": "Find local grocery store deals and manage your shopping list",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0e1a",
+  "theme_color": "#0a0e1a",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

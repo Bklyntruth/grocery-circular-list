@@ -1,0 +1,28 @@
+{
+  "lists": {
+    "2a9407cf-7b14-4566-8b7c-82a1618b70ab": {
+      "id": "2a9407cf-7b14-4566-8b7c-82a1618b70ab",
+      "name": "My List",
+      "items": [
+        {
+          "id": "dda6613a-7ddf-415e-8719-307fbe250fac",
+          "added_at": "2026-05-22T13:35:24.887810+00:00",
+          "checked": false,
+          "store_id": "manual:ctown-7812-flatlands",
+          "store_name": "C-Town",
+          "name": "A. 1. STEAK SAUCE",
+          "price": "$6.99",
+          "unit": null,
+          "category": "Meat",
+          "image_url": "http://f.wishabi.net/page_items/420801883/1779135270/extra_large.jpg"
+        }
+      ]
+    },
+    "1779466489823_6n1bhz": {
+      "id": "1779466489823_6n1bhz",
+      "name": "Weekly Shopping",
+      "items": [],
+      "created": "2026-05-22T16:14:49.911533+00:00"
+    }
+  }
+}
