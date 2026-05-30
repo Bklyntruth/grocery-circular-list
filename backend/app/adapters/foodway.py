@@ -5,6 +5,7 @@ Layout: multi-column grid, item descriptions in small text (sz<15) above
 large price numbers (sz≥30). Cents/prefix tokens sit at sz 18-29.
 """
 
+import asyncio
 import hashlib
 import io
 import re
@@ -347,22 +348,32 @@ class FoodwayAdapter(CircularAdapter):
         ) as client:
             r = await client.get(CIRCULAR_PAGE)
             r.raise_for_status()
-            urls = PDF_RE.findall(r.text)
+            urls = list(dict.fromkeys(PDF_RE.findall(r.text)))  # deduplicated, order preserved
             if not urls:
                 return []
-            pdf_url = urls[0]
-            r2 = await client.get(pdf_url)
-            r2.raise_for_status()
-            pdf_bytes = r2.content
+
+            # Fetch all PDFs concurrently — handles overlap weeks where the site
+            # publishes both the expiring and incoming circular at the same time.
+            async def _fetch_pdf(url: str) -> bytes:
+                r2 = await client.get(url)
+                r2.raise_for_status()
+                return r2.content
+
+            pdf_bytes_list = await asyncio.gather(
+                *[_fetch_pdf(u) for u in urls], return_exceptions=True
+            )
 
         items: list[CircularItem] = []
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                ws = page.extract_words(extra_attrs=["size", "fontname"])
-                page_imgs = _extract_page_images(page)
-                items.extend(_parse_page(ws, page.height, page_imgs))
+        for pdf_bytes, pdf_url in zip(pdf_bytes_list, urls):
+            if isinstance(pdf_bytes, Exception):
+                continue
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    ws = page.extract_words(extra_attrs=["size", "fontname"])
+                    page_imgs = _extract_page_images(page)
+                    items.extend(_parse_page(ws, page.height, page_imgs))
 
-        # De-duplicate by name+price
+        # De-duplicate by name+price across all PDFs
         seen: set[str] = set()
         unique: list[CircularItem] = []
         for it in items:
@@ -372,6 +383,6 @@ class FoodwayAdapter(CircularAdapter):
                 unique.append(it)
 
         if not unique:
-            unique = [CircularItem(name="Weekly Flyer (PDF)", source_url=pdf_url)]
+            unique = [CircularItem(name="Weekly Flyer (PDF)", source_url=urls[0])]
 
         return unique
