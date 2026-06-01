@@ -17,8 +17,10 @@ from pydantic import BaseModel
 from . import locator, grocery_list
 from .adapters import email_imap
 from .adapters import registry as adapter_registry
+from .adapters import vision_extractor
 from .adapters.foodway import _img_store
-from .models import Circular, Store
+from .categorizer import categorize
+from .models import Circular, CircularItem, Store
 
 
 class ImapSource(BaseModel):
@@ -42,6 +44,43 @@ _ZIP_RE = re.compile(r"\b(\d{5})\b")
 def _extract_zip(location: str) -> Optional[str]:
     m = _ZIP_RE.search(location)
     return m.group(1) if m else None
+
+
+async def _fetch_items(adapter, store: Store, zip_code: str) -> list[CircularItem]:
+    """Fetch circular items for a store.
+
+    Primary path: adapter.fetch().
+    Fallback: if fetch() returns nothing and the adapter implements
+    page_image_urls(), run per-page vision extraction automatically.
+    This means any new adapter only needs page_image_urls() to get full
+    deal extraction — no separate vision wiring required.
+    """
+    try:
+        items = await adapter.fetch(store, postal_code=zip_code)
+    except Exception:
+        items = []
+
+    if not items:
+        try:
+            page_urls = await adapter.page_image_urls(store, postal_code=zip_code)
+        except Exception:
+            page_urls = []
+
+        if page_urls:
+            cache_key = f"{adapter.name}:{store.id}"
+            deals = await vision_extractor.extract_deals(page_urls, cache_key=cache_key)
+            items = [
+                CircularItem(
+                    name=d["name"],
+                    price=d.get("price"),
+                    unit=d.get("unit"),
+                    category=categorize(d["name"]),
+                )
+                for d in deals
+                if d.get("name")
+            ]
+
+    return items
 
 
 app = FastAPI(
@@ -133,7 +172,7 @@ async def get_circular(
     zip_code = postal_code or _extract_zip(location) or (store.address and _extract_zip(store.address)) or ""
 
     adapter = adapter_registry.find_for(store)
-    items = await adapter.fetch(store, postal_code=zip_code) if adapter else []
+    items = await _fetch_items(adapter, store, zip_code) if adapter else []
     return Circular(
         store_id=store.id,
         store_name=store.name,
@@ -173,10 +212,7 @@ async def get_all_circulars(
         if cache_key in seen_adapters:
             continue
         seen_adapters.add(cache_key)
-        try:
-            items = await adapter.fetch(store, postal_code=zip_code)
-        except Exception:
-            items = []
+        items = await _fetch_items(adapter, store, zip_code)
         if items:
             results.append(Circular(
                 store_id=store.id,
