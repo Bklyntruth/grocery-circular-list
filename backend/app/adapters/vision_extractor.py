@@ -9,8 +9,19 @@ Free tier: 1,500 requests/day, 15 requests/minute.
 Set the key before starting the server:
     $env:GEMINI_API_KEY = "AIza..."
     python -m uvicorn backend.app.main:app ...
+
+Architecture note — WHY per-page, not batched
+-----------------------------------------------
+Sending multiple pages in one Gemini request causes two failure modes:
+  1. Gemini summarises instead of itemising when overwhelmed with images.
+  2. Long responses get truncated mid-JSON, silently dropping items.
+Each page is processed independently so every item on every page is
+captured at full accuracy.  A semaphore caps concurrent requests at 5,
+staying safely under the free-tier 15 req/min limit.
+DO NOT revert to a batched/all-at-once approach.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -28,16 +39,22 @@ log = logging.getLogger(__name__)
 _MODEL = "gemini-2.5-flash"
 _API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
+# One page at a time — focused, precise, no truncation risk.
 _PROMPT = (
-    "You are reading grocery store weekly circular page images (multiple pages shown).\n"
-    "Extract every sale deal that has a visible price.\n"
+    "You are reading ONE page of a grocery store weekly circular.\n"
+    "Extract EVERY sale deal on this page that has a visible price.\n"
     "Return a JSON array where each element has exactly these fields:\n"
     '  "name"  : product name (string, keep concise)\n'
     '  "price" : sale price exactly as shown, e.g. "$2.99", "2/$5", "BOGO" (string or null)\n'
     '  "unit"  : size/quantity only, e.g. "12 oz", "per lb" — omit fine print (string or null)\n'
+    "List every individual product separately — do NOT group or summarise.\n"
     "Skip headers, banners, and anything without a price.\n"
     "Return ONLY the JSON array. No markdown, no explanation, no extra text."
 )
+
+# Max concurrent Gemini requests. Free tier is 15 req/min; 8 concurrent
+# processes a full circular in one burst while leaving headroom for retries.
+_SEMAPHORE = asyncio.Semaphore(8)
 
 _cache: dict[str, list[dict]] = {}
 
@@ -49,6 +66,9 @@ async def extract_deals(
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> list[dict]:
     """Download circular page images and extract deals via Gemini Flash vision.
+
+    Each page is sent as its own Gemini request so every item is captured
+    individually with its price and image context.
 
     Returns [] if GEMINI_API_KEY is not set or all pages fail.
     Results are cached in memory for the server session lifetime.
@@ -66,7 +86,7 @@ async def extract_deals(
     own_client = http_client is None
     http = http_client or httpx.AsyncClient(timeout=60, follow_redirects=True)
     try:
-        deals = await _extract_all(image_urls, http, api_key)
+        deals = await _extract_all_pages(image_urls, http, api_key)
     finally:
         if own_client:
             await http.aclose()
@@ -85,55 +105,81 @@ def clear_cache(cache_key: Optional[str] = None) -> None:
         _cache.clear()
 
 
-async def _extract_all(urls: list[str], http: httpx.AsyncClient, api_key: str) -> list[dict]:
-    # Download up to 8 pages and send them in ONE Gemini request (= 1 API call total).
-    parts: list[dict] = []
-    for url in urls[:8]:
-        try:
-            r = await http.get(url, timeout=30)
-            if r.status_code != 200:
-                continue
-            ct = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-            if ct not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
-                ct = "image/jpeg"
-            parts.append({"inline_data": {"mime_type": ct, "data": base64.standard_b64encode(r.content).decode()}})
-        except Exception as exc:
-            log.warning("image download error %s: %s", url, exc)
+async def _extract_all_pages(
+    urls: list[str], http: httpx.AsyncClient, api_key: str
+) -> list[dict]:
+    """Process every page independently in parallel (max 5 concurrent)."""
+    tasks = [_extract_one_page(url, http, api_key) for url in urls]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    if not parts:
+    deals: list[dict] = []
+    seen: set[str] = set()
+    for r in results:
+        if isinstance(r, Exception):
+            log.warning("page extraction error: %s", r)
+            continue
+        for d in r:
+            key = (d.get("name", "") + "|" + (d.get("price") or "")).lower()
+            if key not in seen:
+                seen.add(key)
+                deals.append(d)
+    return deals
+
+
+async def _extract_one_page(
+    url: str, http: httpx.AsyncClient, api_key: str
+) -> list[dict]:
+    """Download one circular page image and extract its deals."""
+    # Download the image
+    try:
+        r = await http.get(url, timeout=30)
+        if r.status_code != 200:
+            log.warning("image download %s returned %d", url, r.status_code)
+            return []
+        ct = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+        if ct not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+            ct = "image/jpeg"
+        image_b64 = base64.standard_b64encode(r.content).decode()
+    except Exception as exc:
+        log.warning("image download error %s: %s", url, exc)
         return []
-
-    parts.append({"text": _PROMPT})
 
     payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 65536},
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": ct, "data": image_b64}},
+                {"text": _PROMPT},
+            ]
+        }],
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 8192},
     }
 
-    try:
-        resp = await http.post(
-            f"{_API_BASE}/{_MODEL}:generateContent",
-            params={"key": api_key},
-            json=payload,
-            timeout=120,
-        )
-        if resp.status_code == 429:
-            log.warning("Gemini rate limit — quota exhausted")
+    async with _SEMAPHORE:
+        try:
+            resp = await http.post(
+                f"{_API_BASE}/{_MODEL}:generateContent",
+                params={"key": api_key},
+                json=payload,
+                timeout=90,
+            )
+            if resp.status_code == 429:
+                log.warning("Gemini rate limit hit — page %s skipped", url)
+                return []
+            resp.raise_for_status()
+        except Exception as exc:
+            log.warning("Gemini API error for page %s: %s", url, exc)
             return []
-        resp.raise_for_status()
-    except Exception as exc:
-        log.warning("Gemini API error: %s", exc)
-        return []
 
     try:
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     except (KeyError, IndexError) as exc:
-        log.warning("Gemini unexpected response: %s", exc)
+        log.warning("Gemini unexpected response for %s: %s", url, exc)
         return []
 
+    # Strip markdown code fences if present
     if "```" in text:
-        parts_text = text.split("```")
-        text = parts_text[1]
+        segments = text.split("```")
+        text = segments[1] if len(segments) > 1 else segments[0]
         if text.startswith("json"):
             text = text[4:]
         text = text.strip()
@@ -144,5 +190,5 @@ async def _extract_all(urls: list[str], http: httpx.AsyncClient, api_key: str) -
             return [d for d in result if isinstance(d, dict) and d.get("name")]
         return []
     except json.JSONDecodeError:
-        log.warning("vision: could not parse JSON: %s", text[:300])
+        log.warning("vision: bad JSON from page %s: %s", url, text[:200])
         return []
