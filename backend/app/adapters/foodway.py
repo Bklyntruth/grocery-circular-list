@@ -391,10 +391,17 @@ class FoodwayAdapter(CircularAdapter):
                     page_imgs = _extract_page_images(page)
                     items.extend(_parse_page(ws, page.height, page_imgs))
 
-        # De-duplicate by name+price across all PDFs
+        # De-duplicate by name+price across all PDFs, dropping date/header lines
+        _date_words = re.compile(
+            r"\b(thru|valid|effective|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+            r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|202\d)\b",
+            re.I,
+        )
         seen: set[str] = set()
         unique: list[CircularItem] = []
         for it in items:
+            if _date_words.search(it.name or ""):
+                continue
             key = f"{it.name}|{it.price}"
             if key not in seen:
                 seen.add(key)
