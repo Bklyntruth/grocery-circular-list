@@ -125,7 +125,9 @@ document.getElementById("search").addEventListener("submit", async (e) => {
   $("#circular").innerHTML = "";
   $("#filter-bar").hidden = true;
   $("#filter-input").value = "";
-  document.getElementById("map").hidden = true;
+  const mapEl2 = document.getElementById("map");
+  mapEl2.hidden = true;
+  mapEl2.classList.remove("map-collapsed");
   allStores = [];
   storeById.clear();
   try {
@@ -245,9 +247,15 @@ async function loadCircular(id) {
   const activeCard = document.querySelector(`.store[data-store-id="${id}"]`);
   if (activeCard) activeCard.classList.add("active");
 
-  // Zoom the map to this store
+  // Zoom the map to this store and collapse it so circular results get space
+  const mapEl = document.getElementById("map");
   if (_map && store.lat && store.lon) {
-    _map.flyTo([store.lat, store.lon], 16, { duration: 0.8 });
+    _map.flyTo([store.lat, store.lon], 15, { duration: 0.6 });
+  }
+  if (mapEl) {
+    mapEl.classList.add("map-collapsed");
+    // Let Leaflet know its container resized
+    setTimeout(() => _map && _map.invalidateSize(), 350);
   }
 
   const box = $("#circular");

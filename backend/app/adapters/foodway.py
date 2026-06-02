@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import io
 import re
+import time
 from typing import Optional
 
 import httpx
@@ -30,6 +31,12 @@ _img_store: dict[str, tuple[bytes, str]] = {}
 
 CIRCULAR_PAGE = "https://www.foodwayshop.com/circular"
 PDF_RE = re.compile(r"https?://\S+\.pdf", re.I)
+
+# In-memory result cache — survives request-to-request within one server session.
+# Keyed by the PDF URL so a new circular automatically invalidates the old cache.
+_result_cache: dict[str, list] = {}   # pdf_url → items
+_cache_ts: dict[str, float]    = {}   # pdf_url → fill timestamp
+_CACHE_TTL = 6 * 3600                 # 6 hours
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -345,6 +352,13 @@ class FoodwayAdapter(CircularAdapter):
     async def fetch(self, store: Store, *, postal_code: str) -> list[CircularItem]:
         # Foodway's PDF can be 15-20 MB — use a generous timeout so slow
         # WiFi connections (tablets, phones) don't hit a read timeout mid-download.
+
+        # Quick cache check before downloading anything
+        for pdf_url, items in list(_result_cache.items()):
+            age = time.time() - _cache_ts.get(pdf_url, 0)
+            if age < _CACHE_TTL and items:
+                return items
+
         async with httpx.AsyncClient(
             headers={"User-Agent": UA},
             timeout=httpx.Timeout(connect=15, read=120, write=30, pool=5),
@@ -388,5 +402,11 @@ class FoodwayAdapter(CircularAdapter):
 
         if not unique:
             unique = [CircularItem(name="Weekly Flyer (PDF)", source_url=urls[0])]
+        elif urls:
+            # Cache the good result keyed by the PDF URL
+            pdf_key = urls[0]
+            _result_cache[pdf_key] = unique
+            _cache_ts[pdf_key] = time.time()
 
         return unique
+
