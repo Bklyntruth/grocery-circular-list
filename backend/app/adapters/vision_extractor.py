@@ -271,20 +271,39 @@ async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
 async def _extract_one_page(
     url: str, http: httpx.AsyncClient, api_key: str
 ) -> list[dict]:
-    """Download one circular page image and extract its deals."""
-    # Download the image
+    """Extract deals from one circular page.
+
+    PRIMARY:  OCR.space (free, 500 pages/month, no daily quota)
+    FALLBACK: Gemini Flash (richer structured output, used when OCR returns
+              fewer than 5 items — e.g. dense image-heavy pages)
+
+    OCR.space first means no daily Gemini quota jams in normal use.
+    Gemini steps in silently when OCR misses items on complex pages.
+    """
+    # ── PRIMARY: OCR.space ───────────────────────────────────────────────
+    ocr_deals = await _extract_page_ocr(url, http)
+    if len(ocr_deals) >= 5:
+        log.debug("OCR.space got %d deals from %s", len(ocr_deals), url)
+        return ocr_deals
+
+    # OCR returned too few — try Gemini for better structured extraction
+    if not api_key:
+        return ocr_deals  # no key configured, return what we have
+
+    log.debug("OCR only got %d deals, trying Gemini for %s", len(ocr_deals), url)
+
+    # ── Download image for Gemini ────────────────────────────────────────
     try:
         r = await http.get(url, timeout=30)
         if r.status_code != 200:
-            log.warning("image download %s returned %d", url, r.status_code)
-            return []
+            return ocr_deals
         ct = r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
         if ct not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
             ct = "image/jpeg"
         image_b64 = base64.standard_b64encode(r.content).decode()
     except Exception as exc:
-        log.warning("image download error %s: %s", url, exc)
-        return []
+        log.warning("image download for Gemini %s: %s", url, exc)
+        return ocr_deals
 
     payload = {
         "contents": [{
@@ -296,6 +315,7 @@ async def _extract_one_page(
         "generationConfig": {"temperature": 0, "maxOutputTokens": 16384},
     }
 
+    # ── FALLBACK: Gemini ─────────────────────────────────────────────────
     async with _SEMAPHORE:
         resp = None
         for attempt in range(2):
@@ -308,22 +328,21 @@ async def _extract_one_page(
                 )
                 if resp.status_code == 429:
                     if attempt == 0:
-                        log.info("Gemini rate limit — waiting 15s then retrying page %s", url)
+                        log.info("Gemini rate limit — retrying in 15s for %s", url)
                         await asyncio.sleep(15)
                         continue
-                    log.info("Gemini quota exhausted — falling back to OCR.space for %s", url)
-                    return await _extract_page_ocr(url, http)
+                    log.info("Gemini quota exhausted — using OCR result for %s", url)
+                    return ocr_deals
                 resp.raise_for_status()
                 break
             except Exception as exc:
-                log.warning("Gemini API error for page %s (attempt %d): %s", url, attempt + 1, exc)
+                log.warning("Gemini error for %s (attempt %d): %s", url, attempt + 1, exc)
                 if attempt == 0:
                     await asyncio.sleep(5)
                     continue
-                log.info("Gemini failed twice — falling back to OCR.space for %s", url)
-                return await _extract_page_ocr(url, http)
+                return ocr_deals
         if resp is None:
-            return await _extract_page_ocr(url, http)
+            return ocr_deals
 
     try:
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
