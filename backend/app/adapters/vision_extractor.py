@@ -56,9 +56,9 @@ _PROMPT = (
     "Return ONLY the JSON array. No markdown, no explanation, no extra text."
 )
 
-# Max concurrent Gemini requests. Free tier is 15 req/min; 4 concurrent
-# avoids rate-limit spikes while still processing a 13-page circular in ~20s.
-_SEMAPHORE = asyncio.Semaphore(4)
+# Max concurrent Gemini requests. Free tier is 15 req/min; 5 concurrent
+# balances speed and rate-limit headroom for a 13-page circular.
+_SEMAPHORE = asyncio.Semaphore(5)
 
 _cache: dict[str, list[dict]] = {}
 _cache_ts: dict[str, float] = {}   # NID → unix timestamp of last fill
