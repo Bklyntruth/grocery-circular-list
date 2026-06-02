@@ -200,17 +200,72 @@ async def _extract_all_pages(
 
 
 _OCR_KEY = "helloworld"  # OCR.space free public demo key — 500 pages/month
+
+# Price patterns — ordered from most-specific to least-specific
+# Group "cents": standalone NN¢  (e.g. "39¢", "99 cents")
+# Group "multi": N/$X.XX  (e.g. "2/$5", "3 for $4.99")
+# Group "dollar": $X.XX   (e.g. "$3.99", "$12")
 _PRICE_RE = re.compile(
-    r'(?:(?P<multi>\d+)\s*/?\s*(?:\$|for\s*\$)\s*(?P<mprice>\d+(?:\.\d{2})?)'
-    r'|\$\s*(?P<price>\d+(?:\.\d{2})?))',
+    r'(?:'
+    r'(?P<cents>\d{1,3})\s*[¢c]'                                   # 39¢ / 99c
+    r'|(?P<multi>\d{1,2})\s*/\s*\$\s*(?P<mprice>\d{1,3}(?:\.\d{2})?)'  # 2/$5.99
+    r'|(?P<mfor>\d{1,2})\s+for\s+\$\s*(?P<forprice>\d{1,3}(?:\.\d{2})?)' # 2 for $5
+    r'|\$\s*(?P<dollar>\d{1,3}(?:\.\d{2})?)'                       # $3.99 / $12
+    r')',
     re.I
 )
+
 _JUNK_LINE = re.compile(
     r'^\s*(?:\d{1,2}|\*+|save\b|limit\b|valid\b|offer|wou?\s*buy|thru\b|sunday|monday|'
     r'tuesday|wednesday|thursday|friday|saturday|jan|feb|mar|apr|may|jun|jul|aug|sep|'
     r'oct|nov|dec|shop.?rite|celebrating|america|birthday|stock|buy\s*\d|\s*)[\s\W]*$',
     re.I
 )
+
+# Lines that contain limit/coupon text next to a number should not yield a price
+_LIMIT_NEAR_NUMBER = re.compile(r'\blimit\b|\bbuy\s+\d|\bwhen\s+you\b|\bwith\s+card\b', re.I)
+
+# Maximum believable prices for a grocery item
+_MAX_SINGLE  = 80.0   # lobster, large cuts etc.
+_MAX_MULTI_U = 20.0   # per-unit price in a "N for $X" deal
+
+
+def _parse_price(match: re.Match, line: str) -> str | None:
+    """Convert a regex match to a clean price string, or None if implausible."""
+    if _LIMIT_NEAR_NUMBER.search(line):
+        return None
+
+    if match.group("cents"):
+        val = int(match.group("cents"))
+        if val > 99:
+            return None   # OCR artefact — "199" read as cents would be $1.99, handle below
+        return f"{val}¢"
+
+    if match.group("multi") and match.group("mprice"):
+        n = int(match.group("multi"))
+        total = float(match.group("mprice"))
+        if n < 2 or n > 10 or total > _MAX_SINGLE or (total / n) > _MAX_MULTI_U:
+            return None
+        return f"{n}/${total:.2f}".rstrip("0").rstrip(".")
+
+    if match.group("mfor") and match.group("forprice"):
+        n = int(match.group("mfor"))
+        total = float(match.group("forprice"))
+        if n < 2 or n > 10 or total > _MAX_SINGLE or (total / n) > _MAX_MULTI_U:
+            return None
+        return f"{n} for ${total:.2f}".rstrip("0").rstrip(".")
+
+    if match.group("dollar"):
+        val = float(match.group("dollar"))
+        if val <= 0 or val > _MAX_SINGLE:
+            return None
+        # Drop implausibly round large numbers that look like misread text (e.g. 249 from 39¢)
+        raw = match.group("dollar")
+        if "." not in raw and val >= 100:
+            return None
+        return f"${val:.2f}".rstrip("0").rstrip(".")
+
+    return None
 
 
 async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
@@ -248,21 +303,21 @@ async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
         line = lines[i].strip()
         price_match = _PRICE_RE.search(line)
         if price_match:
-            # Price found on this line — name is on preceding non-junk lines
-            name_parts = []
-            for j in range(max(0, i - 3), i):
-                candidate = lines[j].strip()
-                if candidate and not _JUNK_LINE.match(candidate) and not _PRICE_RE.search(candidate):
-                    name_parts.append(candidate)
-            name = " ".join(name_parts[-2:]).strip() if name_parts else ""
-            if not name and i + 1 < len(lines):
-                name = lines[i + 1].strip()
-            if price_match.group("multi"):
-                price_str = f"{price_match.group('multi')}/${price_match.group('mprice')}"
-            else:
-                price_str = f"${price_match.group('price')}"
-            if name and len(name) > 3 and not _DATE_RE.search(name):
-                deals.append({"name": name, "price": price_str, "unit": None})
+            price_str = _parse_price(price_match, line)
+            if price_str:
+                # Name comes from the preceding 1-2 non-junk lines
+                name_parts = []
+                for j in range(max(0, i - 3), i):
+                    candidate = lines[j].strip()
+                    if (candidate
+                            and not _JUNK_LINE.match(candidate)
+                            and not _PRICE_RE.search(candidate)):
+                        name_parts.append(candidate)
+                name = " ".join(name_parts[-2:]).strip() if name_parts else ""
+                if not name and i + 1 < len(lines):
+                    name = lines[i + 1].strip()
+                if name and len(name) > 3 and not _DATE_RE.search(name):
+                    deals.append({"name": name, "price": price_str, "unit": None})
         i += 1
 
     return [d for d in deals if _is_valid_deal(d)]
