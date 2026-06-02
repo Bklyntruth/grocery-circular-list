@@ -343,8 +343,12 @@ class FoodwayAdapter(CircularAdapter):
         return "foodway" in label.replace(" ", "")
 
     async def fetch(self, store: Store, *, postal_code: str) -> list[CircularItem]:
+        # Foodway's PDF can be 15-20 MB — use a generous timeout so slow
+        # WiFi connections (tablets, phones) don't hit a read timeout mid-download.
         async with httpx.AsyncClient(
-            headers={"User-Agent": UA}, timeout=30, follow_redirects=True
+            headers={"User-Agent": UA},
+            timeout=httpx.Timeout(connect=15, read=120, write=30, pool=5),
+            follow_redirects=True,
         ) as client:
             r = await client.get(CIRCULAR_PAGE)
             r.raise_for_status()
