@@ -199,18 +199,25 @@ async def _extract_all_pages(
     return deals
 
 
-_OCR_KEY = "helloworld"  # OCR.space free public demo key — 500 pages/month
+# OCR.space key — read from env, fall back to demo key for quick starts.
+# Register free at https://ocr.space/OCRAPI (500 pages/month, no credit card).
+# Set OCR_SPACE_KEY in .env for production.  The 'helloworld' demo key is rate-
+# limited to ~10 requests/hour and should only be used for initial testing.
+def _get_ocr_key() -> str:
+    load_dotenv(_ENV_FILE, override=True)
+    return os.environ.get("OCR_SPACE_KEY", "helloworld")
 
-# Price patterns — ordered from most-specific to least-specific
-# Group "cents": standalone NN¢  (e.g. "39¢", "99 cents")
-# Group "multi": N/$X.XX  (e.g. "2/$5", "3 for $4.99")
-# Group "dollar": $X.XX   (e.g. "$3.99", "$12")
+_OCR_KEY = None  # resolved lazily at call time
+
+# Price patterns — ordered most-specific first.
+# Handles OCR quirks: slash often dropped ("2$4" instead of "2/$4"),
+# dollar sign sometimes missed on the total ("2 $4"), etc.
 _PRICE_RE = re.compile(
     r'(?:'
-    r'(?P<cents>\d{1,3})\s*[¢c]'                                   # 39¢ / 99c
-    r'|(?P<multi>\d{1,2})\s*/\s*\$\s*(?P<mprice>\d{1,3}(?:\.\d{2})?)'  # 2/$5.99
-    r'|(?P<mfor>\d{1,2})\s+for\s+\$\s*(?P<forprice>\d{1,3}(?:\.\d{2})?)' # 2 for $5
-    r'|\$\s*(?P<dollar>\d{1,3}(?:\.\d{2})?)'                       # $3.99 / $12
+    r'(?P<cents>\d{1,3})\s*[¢c]\b'                                       # 39¢ / 99c
+    r'|(?P<multi>\d{1,2})\s*[/\\]?\s*\$\s*(?P<mprice>\d{1,3}(?:\.\d{2})?)'  # 2/$5 or 2$5
+    r'|(?P<mfor>\d{1,2})\s+for\s+\$?\s*(?P<forprice>\d{1,3}(?:\.\d{2})?)'   # 2 for $5
+    r'|\$\s*(?P<dollar>\d{1,3}(?:\.\d{2})?)'                               # $3.99
     r')',
     re.I
 )
@@ -222,54 +229,67 @@ _JUNK_LINE = re.compile(
     re.I
 )
 
-# Lines that contain limit/coupon text next to a number should not yield a price
-_LIMIT_NEAR_NUMBER = re.compile(r'\blimit\b|\bbuy\s+\d|\bwhen\s+you\b|\bwith\s+card\b', re.I)
-
-# Maximum believable prices for a grocery item
-_MAX_SINGLE  = 80.0   # lobster, large cuts etc.
-_MAX_MULTI_U = 20.0   # per-unit price in a "N for $X" deal
+# Maximum believable prices
+_MAX_SINGLE  = 80.0   # lobster, large meat cuts, etc.
+_MAX_MULTI_U = 25.0   # per-unit in a "N for $X" deal
 
 
 def _parse_price(match: re.Match, line: str) -> str | None:
-    """Convert a regex match to a clean price string, or None if implausible."""
-    if _LIMIT_NEAR_NUMBER.search(line):
+    """Convert a regex match to a clean price string, or None if implausible.
+
+    Rejects:
+    - Prices > $80 for a single item
+    - 3-digit integers without a decimal (e.g. 249 — misread OCR artefacts)
+    - Lines where the ONLY content besides the price is a limit/coupon phrase
+    """
+    # Only reject if the ENTIRE line is a coupon/limit phrase with no product context.
+    # Don't reject valid price lines that happen to mention "limit" among other text.
+    stripped = line.strip()
+    is_limit_only_line = bool(re.match(
+        r'^\s*(?:limit|buy\s+\d|when\s+you|with\s+card|save\b|valid\b)[^\$\d]*$',
+        stripped, re.I
+    ))
+    if is_limit_only_line:
         return None
 
     if match.group("cents"):
         val = int(match.group("cents"))
         if val > 99:
-            return None   # OCR artefact — "199" read as cents would be $1.99, handle below
+            return None
         return f"{val}¢"
 
     if match.group("multi") and match.group("mprice"):
         n = int(match.group("multi"))
         total = float(match.group("mprice"))
-        if n < 2 or n > 10 or total > _MAX_SINGLE or (total / n) > _MAX_MULTI_U:
+        if n < 2 or n > 10 or total <= 0 or total > _MAX_SINGLE or (total / n) > _MAX_MULTI_U:
             return None
-        return f"{n}/${total:.2f}".rstrip("0").rstrip(".")
+        price = f"{n}/${total:.2f}"
+        return price.rstrip("0").rstrip(".")
 
     if match.group("mfor") and match.group("forprice"):
         n = int(match.group("mfor"))
         total = float(match.group("forprice"))
-        if n < 2 or n > 10 or total > _MAX_SINGLE or (total / n) > _MAX_MULTI_U:
+        if n < 2 or n > 10 or total <= 0 or total > _MAX_SINGLE or (total / n) > _MAX_MULTI_U:
             return None
-        return f"{n} for ${total:.2f}".rstrip("0").rstrip(".")
+        price = f"{n}/${total:.2f}"
+        return price.rstrip("0").rstrip(".")
 
     if match.group("dollar"):
-        val = float(match.group("dollar"))
+        raw = match.group("dollar")
+        val = float(raw)
         if val <= 0 or val > _MAX_SINGLE:
             return None
-        # Drop implausibly round large numbers that look like misread text (e.g. 249 from 39¢)
-        raw = match.group("dollar")
+        # Reject raw integers >= 100 with no decimal — almost always OCR artefacts
         if "." not in raw and val >= 100:
             return None
-        return f"${val:.2f}".rstrip("0").rstrip(".")
+        price = f"${val:.2f}"
+        return price.rstrip("0").rstrip(".")
 
     return None
 
 
 async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
-    """OCR.space fallback when Gemini quota is exhausted. Free, 500 pages/month."""
+    """OCR.space — primary extractor. Free, 500 pages/month with a registered key."""
     try:
         img_r = await http.get(url, timeout=30)
         if img_r.status_code != 200:
@@ -280,7 +300,7 @@ async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
         resp = await http.post(
             "https://api.ocr.space/parse/image",
             data={
-                "apikey": _OCR_KEY,
+                "apikey": _get_ocr_key(),
                 "base64Image": f"data:{ct};base64,{b64}",
                 "language": "eng",
                 "isTable": "false",
@@ -289,7 +309,13 @@ async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
             },
             timeout=60,
         )
+        if resp.status_code == 429:
+            log.warning("OCR.space rate limit hit — key may need upgrading at ocr.space/OCRAPI")
+            return []
         result = resp.json()
+        if result.get("IsErroredOnProcessing") or result.get("OCRExitCode") == 6:
+            log.warning("OCR.space error for %s: %s", url, result.get("ErrorMessage"))
+            return []
         raw_text = result.get("ParsedResults", [{}])[0].get("ParsedText", "")
     except Exception as exc:
         log.warning("OCR.space error %s: %s", url, exc)
