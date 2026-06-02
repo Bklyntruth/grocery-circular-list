@@ -26,6 +26,7 @@ import base64
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -198,6 +199,75 @@ async def _extract_all_pages(
     return deals
 
 
+_OCR_KEY = "helloworld"  # OCR.space free public demo key — 500 pages/month
+_PRICE_RE = re.compile(
+    r'(?:(?P<multi>\d+)\s*/?\s*(?:\$|for\s*\$)\s*(?P<mprice>\d+(?:\.\d{2})?)'
+    r'|\$\s*(?P<price>\d+(?:\.\d{2})?))',
+    re.I
+)
+_JUNK_LINE = re.compile(
+    r'^\s*(?:\d{1,2}|\*+|save\b|limit\b|valid\b|offer|wou?\s*buy|thru\b|sunday|monday|'
+    r'tuesday|wednesday|thursday|friday|saturday|jan|feb|mar|apr|may|jun|jul|aug|sep|'
+    r'oct|nov|dec|shop.?rite|celebrating|america|birthday|stock|buy\s*\d|\s*)[\s\W]*$',
+    re.I
+)
+
+
+async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
+    """OCR.space fallback when Gemini quota is exhausted. Free, 500 pages/month."""
+    try:
+        img_r = await http.get(url, timeout=30)
+        if img_r.status_code != 200:
+            return []
+        b64 = base64.standard_b64encode(img_r.content).decode()
+        ct = img_r.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+
+        resp = await http.post(
+            "https://api.ocr.space/parse/image",
+            data={
+                "apikey": _OCR_KEY,
+                "base64Image": f"data:{ct};base64,{b64}",
+                "language": "eng",
+                "isTable": "false",
+                "scale": "true",
+                "OCREngine": "2",
+            },
+            timeout=60,
+        )
+        result = resp.json()
+        raw_text = result.get("ParsedResults", [{}])[0].get("ParsedText", "")
+    except Exception as exc:
+        log.warning("OCR.space error %s: %s", url, exc)
+        return []
+
+    # Parse deals from the OCR text
+    lines = raw_text.splitlines()
+    deals: list[dict] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        price_match = _PRICE_RE.search(line)
+        if price_match:
+            # Price found on this line — name is on preceding non-junk lines
+            name_parts = []
+            for j in range(max(0, i - 3), i):
+                candidate = lines[j].strip()
+                if candidate and not _JUNK_LINE.match(candidate) and not _PRICE_RE.search(candidate):
+                    name_parts.append(candidate)
+            name = " ".join(name_parts[-2:]).strip() if name_parts else ""
+            if not name and i + 1 < len(lines):
+                name = lines[i + 1].strip()
+            if price_match.group("multi"):
+                price_str = f"{price_match.group('multi')}/${price_match.group('mprice')}"
+            else:
+                price_str = f"${price_match.group('price')}"
+            if name and len(name) > 3 and not _DATE_RE.search(name):
+                deals.append({"name": name, "price": price_str, "unit": None})
+        i += 1
+
+    return [d for d in deals if _is_valid_deal(d)]
+
+
 async def _extract_one_page(
     url: str, http: httpx.AsyncClient, api_key: str
 ) -> list[dict]:
@@ -241,8 +311,8 @@ async def _extract_one_page(
                         log.info("Gemini rate limit — waiting 15s then retrying page %s", url)
                         await asyncio.sleep(15)
                         continue
-                    log.warning("Gemini rate limit persists — page %s skipped", url)
-                    return []
+                    log.info("Gemini quota exhausted — falling back to OCR.space for %s", url)
+                    return await _extract_page_ocr(url, http)
                 resp.raise_for_status()
                 break
             except Exception as exc:
@@ -250,9 +320,10 @@ async def _extract_one_page(
                 if attempt == 0:
                     await asyncio.sleep(5)
                     continue
-                return []
+                log.info("Gemini failed twice — falling back to OCR.space for %s", url)
+                return await _extract_page_ocr(url, http)
         if resp is None:
-            return []
+            return await _extract_page_ocr(url, http)
 
     try:
         text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
