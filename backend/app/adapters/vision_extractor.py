@@ -44,19 +44,77 @@ _PROMPT = (
     "You are reading ONE page of a grocery store weekly circular.\n"
     "Extract EVERY sale deal on this page that has a visible price.\n"
     "Return a JSON array where each element has exactly these fields:\n"
-    '  "name"  : product name (string, keep concise)\n'
+    '  "name"  : product name only — a real grocery product (string, keep concise, 2-6 words)\n'
     '  "price" : sale price exactly as shown, e.g. "$2.99", "2/$5", "BOGO" (string or null)\n'
     '  "unit"  : size/quantity only, e.g. "12 oz", "per lb" — omit fine print (string or null)\n'
-    "List every individual product separately — do NOT group or summarise.\n"
-    "Skip headers, banners, and anything without a price.\n"
+    "Rules:\n"
+    "- name must be an actual food or household product, never a date, store name, or slogan\n"
+    "- SKIP: date ranges (e.g. 'Valid thru', 'Thru Saturday', any line containing a month/year)\n"
+    "- SKIP: store brand banners, circular headers, legal fine print, page numbers\n"
+    "- SKIP: anything whose 'name' would be a unit, size, or quantity alone (e.g. '12 oz', 'per lb')\n"
+    "- List every individual product separately — do NOT group or summarise\n"
     "Return ONLY the JSON array. No markdown, no explanation, no extra text."
 )
 
-# Max concurrent Gemini requests. Free tier is 15 req/min; 8 concurrent
-# processes a full circular in one burst while leaving headroom for retries.
-_SEMAPHORE = asyncio.Semaphore(8)
+# Max concurrent Gemini requests. Free tier is 15 req/min; 4 concurrent
+# avoids rate-limit spikes while still processing a 13-page circular in ~20s.
+_SEMAPHORE = asyncio.Semaphore(4)
 
 _cache: dict[str, list[dict]] = {}
+_cache_ts: dict[str, float] = {}   # NID → unix timestamp of last fill
+_CACHE_TTL = 6 * 3600              # 6 hours — re-extract after circular updates
+
+# Patterns that indicate a garbled / non-product entry
+import re as _re
+_DATE_RE = _re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b"
+    r"|\bthru\b|\bvalid\b|\beffective\b|\bsaturday\b|\bsunday\b"
+    r"|\bmonday\b|\btuesday\b|\bwednesday\b|\bthursday\b|\bfriday\b"
+    r"|\b202[0-9]\b",
+    _re.I,
+)
+_UNIT_ONLY_RE = _re.compile(
+    r"^[\d\s./\-]*(oz|fl oz|lb|lbs|pk|ct|ml|g|kg|btl|can|pkg|qt|gal|pint|doz|count)\.?\s*$",
+    _re.I,
+)
+
+
+def _recover_partial_json(text: str) -> list[dict]:
+    """Extract complete JSON objects from a truncated array string."""
+    items = []
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    obj = json.loads(text[start:i + 1])
+                    if isinstance(obj, dict) and obj.get("name"):
+                        items.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    return items
+
+
+def _is_valid_deal(d: dict) -> bool:
+    name = (d.get("name") or "").strip()
+    if not name or len(name) < 3:
+        return False
+    if _DATE_RE.search(name):
+        return False
+    if _UNIT_ONLY_RE.match(name):
+        return False
+    # Price must look like money; skip entries that only have None/empty price
+    price = (d.get("price") or "").strip()
+    if not price:
+        return False
+    return True
 
 
 async def extract_deals(
@@ -74,8 +132,15 @@ async def extract_deals(
     Results are cached in memory for the server session lifetime.
     """
     if cache_key and cache_key in _cache:
-        log.debug("vision cache hit %s (%d deals)", cache_key, len(_cache[cache_key]))
-        return _cache[cache_key]
+        import time
+        age = time.time() - _cache_ts.get(cache_key, 0)
+        if age < _CACHE_TTL:
+            log.debug("vision cache hit %s (%d deals, age %.0fs)", cache_key, len(_cache[cache_key]), age)
+            return _cache[cache_key]
+        # Stale cache — re-extract
+        log.info("vision cache expired for %s (age %.0fs) — re-extracting", cache_key, age)
+        _cache.pop(cache_key, None)
+        _cache_ts.pop(cache_key, None)
 
     load_dotenv(_ENV_FILE, override=True)
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -92,7 +157,9 @@ async def extract_deals(
             await http.aclose()
 
     if cache_key and deals:
+        import time
         _cache[cache_key] = deals
+        _cache_ts[cache_key] = time.time()
     log.info("vision extracted %d deals from %d pages (key=%s)",
              len(deals), len(image_urls), cache_key)
     return deals
@@ -101,8 +168,10 @@ async def extract_deals(
 def clear_cache(cache_key: Optional[str] = None) -> None:
     if cache_key:
         _cache.pop(cache_key, None)
+        _cache_ts.pop(cache_key, None)
     else:
         _cache.clear()
+        _cache_ts.clear()
 
 
 async def _extract_all_pages(
@@ -119,6 +188,9 @@ async def _extract_all_pages(
             log.warning("page extraction error: %s", r)
             continue
         for d in r:
+            if not _is_valid_deal(d):
+                log.debug("vision filter dropped: %s", d.get("name"))
+                continue
             key = (d.get("name", "") + "|" + (d.get("price") or "")).lower()
             if key not in seen:
                 seen.add(key)
@@ -151,23 +223,35 @@ async def _extract_one_page(
                 {"text": _PROMPT},
             ]
         }],
-        "generationConfig": {"temperature": 0, "maxOutputTokens": 8192},
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 16384},
     }
 
     async with _SEMAPHORE:
-        try:
-            resp = await http.post(
-                f"{_API_BASE}/{_MODEL}:generateContent",
-                params={"key": api_key},
-                json=payload,
-                timeout=90,
-            )
-            if resp.status_code == 429:
-                log.warning("Gemini rate limit hit — page %s skipped", url)
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = await http.post(
+                    f"{_API_BASE}/{_MODEL}:generateContent",
+                    params={"key": api_key},
+                    json=payload,
+                    timeout=90,
+                )
+                if resp.status_code == 429:
+                    if attempt == 0:
+                        log.info("Gemini rate limit — waiting 15s then retrying page %s", url)
+                        await asyncio.sleep(15)
+                        continue
+                    log.warning("Gemini rate limit persists — page %s skipped", url)
+                    return []
+                resp.raise_for_status()
+                break
+            except Exception as exc:
+                log.warning("Gemini API error for page %s (attempt %d): %s", url, attempt + 1, exc)
+                if attempt == 0:
+                    await asyncio.sleep(5)
+                    continue
                 return []
-            resp.raise_for_status()
-        except Exception as exc:
-            log.warning("Gemini API error for page %s: %s", url, exc)
+        if resp is None:
             return []
 
     try:
@@ -190,5 +274,10 @@ async def _extract_one_page(
             return [d for d in result if isinstance(d, dict) and d.get("name")]
         return []
     except json.JSONDecodeError:
-        log.warning("vision: bad JSON from page %s: %s", url, text[:200])
+        # Truncated response — recover complete objects before the cut-off point
+        recovered = _recover_partial_json(text)
+        if recovered:
+            log.info("vision: recovered %d items from truncated JSON on %s", len(recovered), url)
+            return recovered
+        log.warning("vision: unrecoverable JSON from page %s: %s", url, text[:200])
         return []
