@@ -331,13 +331,14 @@ async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
         if price_match:
             price_str = _parse_price(price_match, line)
             if price_str:
-                # Name comes from the preceding 1-2 non-junk lines
+                # Name comes from the preceding 1-2 non-junk, non-date lines
                 name_parts = []
                 for j in range(max(0, i - 3), i):
                     candidate = lines[j].strip()
                     if (candidate
                             and not _JUNK_LINE.match(candidate)
-                            and not _PRICE_RE.search(candidate)):
+                            and not _PRICE_RE.search(candidate)
+                            and not _DATE_RE.search(candidate)):
                         name_parts.append(candidate)
                 name = " ".join(name_parts[-2:]).strip() if name_parts else ""
                 if not name and i + 1 < len(lines):
