@@ -118,17 +118,18 @@ def _match_image(col_x: float, prev_y: float, row_y: float,
     return images.pop(best_idx)["url"]
 
 
+# NOTE: the old _dedupe(s) function used to strip every pair of consecutive
+# identical letters at the string level to deal with PDFs that render bold
+# text by drawing each glyph twice. That was way too aggressive — it also
+# removed legitimate doubles ("Butterball" → "Buterbal", "Bottom" → "Botom",
+# "Boneless" → "Boneles", "Cheese" → "Chese"). The current implementation
+# uses pdfplumber's page.dedupe_chars(tolerance=1) upstream of word
+# extraction (see FoodwayAdapter.fetch), which operates on character
+# POSITIONS rather than resulting text and correctly keeps intended doubles.
+#
+# Legacy function kept as an identity for safety during review/debug.
 def _dedupe(s: str) -> str:
-    out = []
-    i = 0
-    while i < len(s):
-        if i + 1 < len(s) and s[i] == s[i + 1] and s[i].isalpha():
-            out.append(s[i])
-            i += 2
-        else:
-            out.append(s[i])
-            i += 1
-    return "".join(out)
+    return s
 
 
 def _section_boundaries(words: list[dict]) -> list[tuple[float, str]]:
@@ -253,11 +254,17 @@ def _parse_page(words: list[dict], page_height: float,
             else:
                 price_str = f"${dollar_text}.{cents}"
 
-            # Collect item description text in same column, above this price row
-            half_w = 85
+            # Collect item description text in same column, above this price row.
+            # IMPORTANT: use the per-column x_lo / x_hi midpoints (computed
+            # above from adjacent column centers) rather than a symmetric
+            # ±85pt window around col_x. The symmetric window overlapped with
+            # neighboring columns and caused words from adjacent items to
+            # bleed into the current item's name ("Chicken Chicken",
+            # "USDA USDA", "Boneles Boneles"). The midpoint-based range gives
+            # each word exactly one owning column.
             candidates = [
                 w for w in item_ws
-                if abs(w["x"] - col_x) < half_w
+                if x_lo <= w["x"] < x_hi
                 and prev_y <= w["y"] < row_y - 3
             ]
             if not candidates:
@@ -387,6 +394,14 @@ class FoodwayAdapter(CircularAdapter):
                 continue
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 for page in pdf.pages:
+                    # dedupe_chars collapses overlapping identical glyphs
+                    # (PDF bold-emulation artifact) at the character-position
+                    # level. This replaces the old string-level _dedupe which
+                    # also stripped intentional double letters.
+                    try:
+                        page = page.dedupe_chars(tolerance=1)
+                    except Exception:
+                        pass  # some PDFs lack cropbox/mediabox — fall back
                     ws = page.extract_words(extra_attrs=["size", "fontname"])
                     page_imgs = _extract_page_images(page)
                     items.extend(_parse_page(ws, page.height, page_imgs))
