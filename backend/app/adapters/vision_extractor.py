@@ -61,6 +61,11 @@ _PROMPT = (
 # balances speed and rate-limit headroom for a 13-page circular.
 _SEMAPHORE = asyncio.Semaphore(5)
 
+# Set when Gemini reports the free tier's DAILY request limit is used up.
+# Waiting won't help until it resets, so skip Gemini (and its retry waits)
+# for an hour instead of stalling every remaining page for ~2 minutes.
+_gemini_daily_block_until = 0.0
+
 _cache: dict[str, list[dict]] = {}
 _cache_ts: dict[str, float] = {}   # NID → unix timestamp of last fill
 _CACHE_TTL = 6 * 3600              # 6 hours — re-extract after circular updates
@@ -396,6 +401,7 @@ async def _extract_one_page(
     OCR.space first means no daily Gemini quota jams in normal use.
     Gemini steps in silently when OCR misses items on complex pages.
     """
+    global _gemini_daily_block_until
     # ── PRIMARY: OCR.space ───────────────────────────────────────────────
     ocr_deals = await _extract_page_ocr(url, http)
     if len(ocr_deals) >= 5:
@@ -405,6 +411,9 @@ async def _extract_one_page(
     # OCR returned too few — try Gemini for better structured extraction
     if not api_key:
         return ocr_deals  # no key configured, return what we have
+    import time
+    if time.time() < _gemini_daily_block_until:
+        return ocr_deals  # daily quota used up earlier in this run
 
     log.debug("OCR only got %d deals, trying Gemini for %s", len(ocr_deals), url)
 
@@ -448,6 +457,10 @@ async def _extract_one_page(
                     timeout=90,
                 )
                 if resp.status_code == 429:
+                    if "PerDay" in resp.text:
+                        _gemini_daily_block_until = time.time() + 3600
+                        log.warning("Gemini daily free-tier limit reached — skipping Gemini for 1h")
+                        return ocr_deals
                     if rate_waits:
                         wait = rate_waits.pop(0)
                         log.info("Gemini rate limit — retrying in %ds for %s", wait, url)

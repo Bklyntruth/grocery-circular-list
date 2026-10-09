@@ -431,10 +431,13 @@ async def _fetch_items_cached(adapter, store, zip_code, fresh=False):
         items = await _fetch_items(adapter, store, zip_code)
     except Exception:
         return cache.stale(key, zip_code) or []
-    if items:
+    # Only cache results that carry prices. When vision is unavailable (no key,
+    # Gemini quota used up) ShopRite comes back as names only — serve the last
+    # priced copy instead of caching the priceless one over it for 24h.
+    if any(getattr(i, "price", None) for i in items):
         cache.put(key, zip_code, items)
         return items
-    return cache.stale(key, zip_code) or []
+    return cache.stale(key, zip_code) or items
 
 
 # Rescan doorbell (see rescan.py). Exposed publicly through a Tailscale Funnel
