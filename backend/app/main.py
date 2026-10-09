@@ -1,6 +1,7 @@
 import imaplib
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -17,7 +18,7 @@ from pydantic import BaseModel
 from . import locator, grocery_list
 from .adapters import email_imap
 from .adapters import registry as adapter_registry
-from .adapters import vision_extractor
+from .adapters import foodway, vision_extractor
 from .adapters.foodway import _img_store
 from .categorizer import categorize
 from .models import Circular, CircularItem, Store
@@ -44,6 +45,26 @@ _ZIP_RE = re.compile(r"\b(\d{5})\b")
 def _extract_zip(location: str) -> Optional[str]:
     m = _ZIP_RE.search(location)
     return m.group(1) if m else None
+
+
+# ?refresh=1 drops the 6-hour Foodway / vision-OCR result caches so the next
+# fetch re-reads the circulars. Throttled because vision re-extraction spends
+# Gemini quota; a refresh inside the window just serves the cached results.
+_REFRESH_MIN_INTERVAL = 10 * 60
+_last_refresh = 0.0
+
+
+def _maybe_clear_result_caches(refresh: bool) -> bool:
+    """Clear cached circular results if asked and not throttled. Returns True if cleared."""
+    global _last_refresh
+    if not refresh or time.time() - _last_refresh < _REFRESH_MIN_INTERVAL:
+        return False
+    _last_refresh = time.time()
+    foodway._result_cache.clear()
+    foodway._cache_ts.clear()
+    vision_extractor._cache.clear()
+    vision_extractor._cache_ts.clear()
+    return True
 
 
 async def _fetch_items(adapter, store: Store, zip_code: str) -> list[CircularItem]:
@@ -155,7 +176,9 @@ async def get_circular(
     lat: Optional[float] = Query(None),
     lon: Optional[float] = Query(None),
     ref: Optional[str] = Query(None, description="Adapter-specific store code (e.g. Red Pepper store ID)"),
+    refresh: bool = Query(False, description="Re-read the circular instead of serving cached results (throttled)"),
 ) -> Circular:
+    _maybe_clear_result_caches(refresh)
     if name and lat is not None and lon is not None:
         store = Store(id=store_id, name=name, brand=brand, lat=lat, lon=lon, ref=ref)
     else:
@@ -186,12 +209,14 @@ async def get_all_circulars(
     location: str = Query(..., description="Zip code, address, or place name"),
     radius_m: int = Query(4800, ge=200, le=20000),
     postal_code: Optional[str] = Query(None),
+    refresh: bool = Query(False, description="Re-read every circular instead of serving cached results (throttled)"),
 ) -> list[Circular]:
     """
     Convenience endpoint for Pantry Portal and other integrations.
     Returns circulars for every store with a supported adapter near the given location.
     Stores without a parser return an empty items list (still included in response).
     """
+    _maybe_clear_result_caches(refresh)
     coords = await locator.geocode(location)
     if not coords:
         raise HTTPException(404, f"Could not geocode '{location}'")
