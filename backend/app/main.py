@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from . import locator, grocery_list
 from .adapters import email_imap
+from . import cache
 from .adapters import registry as adapter_registry
 from .adapters import foodway, vision_extractor
 from .adapters.foodway import _img_store
@@ -195,7 +196,7 @@ async def get_circular(
     zip_code = postal_code or _extract_zip(location) or (store.address and _extract_zip(store.address)) or ""
 
     adapter = adapter_registry.find_for(store)
-    items = await _fetch_items(adapter, store, zip_code) if adapter else []
+    items = await _fetch_items_cached(adapter, store, zip_code) if adapter else []
     return Circular(
         store_id=store.id,
         store_name=store.name,
@@ -237,7 +238,7 @@ async def get_all_circulars(
         if cache_key in seen_adapters:
             continue
         seen_adapters.add(cache_key)
-        items = await _fetch_items(adapter, store, zip_code)
+        items = await _fetch_items_cached(adapter, store, zip_code)
         if items:
             results.append(Circular(
                 store_id=store.id,
@@ -401,6 +402,27 @@ def save_settings(body: dict) -> dict:
     _ENV_FILE.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     os.environ["GEMINI_API_KEY"] = new_key
     return {"ok": True}
+
+
+
+async def _fetch_items_cached(adapter, store, zip_code):
+    """Cache wrapper around _fetch_items. Falls back to stale data on failure."""
+    hit = cache.get(adapter.name, zip_code)
+    if hit is not None:
+        return hit
+    try:
+        items = await _fetch_items(adapter, store, zip_code)
+    except Exception:
+        return cache.stale(adapter.name, zip_code) or []
+    if items:
+        cache.put(adapter.name, zip_code, items)
+        return items
+    return cache.stale(adapter.name, zip_code) or []
+
+
+@app.get("/api/cache/health", summary="Per-adapter cache status")
+def cache_health():
+    return cache.health()
 
 
 if FRONTEND_DIR.exists():
