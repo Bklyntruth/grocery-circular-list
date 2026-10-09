@@ -9,7 +9,7 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import locator, grocery_list
 from .adapters import email_imap
-from . import cache
+from . import cache, rescan
 from .adapters import registry as adapter_registry
 from .adapters import foodway, vision_extractor
 from .adapters.foodway import _img_store
@@ -48,8 +48,8 @@ def _extract_zip(location: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-# ?refresh=1 drops the 6-hour Foodway / vision-OCR result caches so the next
-# fetch re-reads the circulars. Throttled because vision re-extraction spends
+# ?refresh=1 drops the 6-hour Foodway / vision-OCR memory caches and skips the
+# 24-hour SQLite cache (cache.py) so the next fetch re-reads the circulars. Throttled because vision re-extraction spends
 # Gemini quota; a refresh inside the window just serves the cached results.
 _REFRESH_MIN_INTERVAL = 10 * 60
 _last_refresh = 0.0
@@ -179,7 +179,7 @@ async def get_circular(
     ref: Optional[str] = Query(None, description="Adapter-specific store code (e.g. Red Pepper store ID)"),
     refresh: bool = Query(False, description="Re-read the circular instead of serving cached results (throttled)"),
 ) -> Circular:
-    _maybe_clear_result_caches(refresh)
+    fresh = _maybe_clear_result_caches(refresh)
     if name and lat is not None and lon is not None:
         store = Store(id=store_id, name=name, brand=brand, lat=lat, lon=lon, ref=ref)
     else:
@@ -196,7 +196,7 @@ async def get_circular(
     zip_code = postal_code or _extract_zip(location) or (store.address and _extract_zip(store.address)) or ""
 
     adapter = adapter_registry.find_for(store)
-    items = await _fetch_items_cached(adapter, store, zip_code) if adapter else []
+    items = await _fetch_items_cached(adapter, store, zip_code, fresh=fresh) if adapter else []
     return Circular(
         store_id=store.id,
         store_name=store.name,
@@ -217,7 +217,7 @@ async def get_all_circulars(
     Returns circulars for every store with a supported adapter near the given location.
     Stores without a parser return an empty items list (still included in response).
     """
-    _maybe_clear_result_caches(refresh)
+    fresh = _maybe_clear_result_caches(refresh)
     coords = await locator.geocode(location)
     if not coords:
         raise HTTPException(404, f"Could not geocode '{location}'")
@@ -233,12 +233,12 @@ async def get_all_circulars(
         adapter = adapter_registry.find_for(store)
         if not adapter:
             continue
-        # Deduplicate by adapter name — same chain flyer fetched once
-        cache_key = f"{adapter.name}:{zip_code}"
+        # Deduplicate so each chain's flyer is fetched once per ZIP
+        cache_key = f"{_source_key(adapter, store)}:{zip_code}"
         if cache_key in seen_adapters:
             continue
         seen_adapters.add(cache_key)
-        items = await _fetch_items_cached(adapter, store, zip_code)
+        items = await _fetch_items_cached(adapter, store, zip_code, fresh=fresh)
         if items:
             results.append(Circular(
                 store_id=store.id,
@@ -405,19 +405,65 @@ def save_settings(body: dict) -> dict:
 
 
 
-async def _fetch_items_cached(adapter, store, zip_code):
-    """Cache wrapper around _fetch_items. Falls back to stale data on failure."""
-    hit = cache.get(adapter.name, zip_code)
-    if hit is not None:
-        return hit
+def _source_key(adapter, store) -> str:
+    """Identity of a circular source. Most adapters serve one chain, but the
+    Flipp adapter serves many brands (C-Town, Aldi, Bravo, …) and fetches the
+    flyer for the store's own brand — so key it per brand, or every Flipp store
+    after the first is skipped and shares the first one's cached deals."""
+    if adapter.name != "flipp":
+        return adapter.name
+    brand = (store.brand or store.name or "").lower().strip()
+    return f"flipp-{brand}"
+
+
+async def _fetch_items_cached(adapter, store, zip_code, fresh=False):
+    """Cache wrapper around _fetch_items. Falls back to stale data on failure.
+
+    fresh=True skips the cache read (a forced refresh) but still writes the
+    new result back and still falls back to stale data if the fetch fails.
+    """
+    key = _source_key(adapter, store)
+    if not fresh:
+        hit = cache.get(key, zip_code)
+        if hit is not None:
+            return hit
     try:
         items = await _fetch_items(adapter, store, zip_code)
     except Exception:
-        return cache.stale(adapter.name, zip_code) or []
+        return cache.stale(key, zip_code) or []
     if items:
-        cache.put(adapter.name, zip_code, items)
+        cache.put(key, zip_code, items)
         return items
-    return cache.stale(adapter.name, zip_code) or []
+    return cache.stale(key, zip_code) or []
+
+
+# Rescan doorbell (see rescan.py). Exposed publicly through a Tailscale Funnel
+# path so iPads without Tailscale can trigger it; every call needs the key
+# from data/rescan.json, passed as ?key= or an X-Rescan-Key header.
+def _require_rescan_key(key: Optional[str], header_key: Optional[str]) -> None:
+    if not rescan.key_ok(key or header_key):
+        raise HTTPException(403, "Invalid or missing rescan key")
+
+
+@app.post("/api/rescan", summary="Re-read every circular and write the deals to the pantry sheet")
+async def start_rescan(
+    key: Optional[str] = Query(None),
+    zip: Optional[str] = Query(None, description="Defaults to the ZIP in rescan.json"),
+    x_rescan_key: Optional[str] = Header(None),
+) -> dict:
+    _require_rescan_key(key, x_rescan_key)
+
+    async def fetch_all(z: str) -> list[Circular]:
+        return await get_all_circulars(location=z, radius_m=4800, postal_code=z, refresh=True)
+
+    started = rescan.start(fetch_all, zip)
+    return {"ok": True, "started": started, **rescan.status()}
+
+
+@app.get("/api/rescan/status", summary="Progress of the last rescan")
+def rescan_status(key: Optional[str] = Query(None), x_rescan_key: Optional[str] = Header(None)) -> dict:
+    _require_rescan_key(key, x_rescan_key)
+    return {"ok": True, **rescan.status()}
 
 
 @app.get("/api/cache/health", summary="Per-adapter cache status")
