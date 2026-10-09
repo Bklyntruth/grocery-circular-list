@@ -143,10 +143,9 @@ async def extract_deals(
         _cache.pop(cache_key, None)
         _cache_ts.pop(cache_key, None)
 
-    load_dotenv(_ENV_FILE, override=True)
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = await _resolve_gemini_key()
     if not api_key:
-        log.warning("GEMINI_API_KEY not set — skipping vision price extraction")
+        log.warning("No Gemini key (GEMINI_API_KEY or pantry) — skipping vision price extraction")
         return []
 
     own_client = http_client is None
@@ -164,6 +163,41 @@ async def extract_deals(
     log.info("vision extracted %d deals from %d pages (key=%s)",
              len(deals), len(image_urls), cache_key)
     return deals
+
+
+_pantry_key: Optional[str] = None
+_pantry_key_ts = 0.0
+_PANTRY_KEY_TTL = 3600
+
+
+async def _resolve_gemini_key() -> Optional[str]:
+    """GEMINI_API_KEY from the environment/.env, else the key the family saved
+    in Pantry Portal (Settings → Gemini key), read from the pantry Apps Script
+    named in data/rescan.json. Cached for an hour."""
+    global _pantry_key, _pantry_key_ts
+    load_dotenv(_ENV_FILE, override=True)
+    env_key = os.environ.get("GEMINI_API_KEY")
+    if env_key:
+        return env_key
+    import time
+    if _pantry_key and time.time() - _pantry_key_ts < _PANTRY_KEY_TTL:
+        return _pantry_key
+    try:
+        cfg_path = Path(os.environ.get("DATA_DIR", "/app/data")) / "rescan.json"
+        sheets_url = json.loads(cfg_path.read_text(encoding="utf-8")).get("sheets_url")
+    except (OSError, ValueError):
+        return None
+    if not sheets_url:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(sheets_url, params={"action": "get_gemini_key"})
+            key = (r.json() or {}).get("key") or None
+    except Exception as e:
+        log.warning("could not read Gemini key from pantry: %s", e)
+        return None
+    _pantry_key, _pantry_key_ts = key, time.time()
+    return key
 
 
 def clear_cache(cache_key: Optional[str] = None) -> None:
