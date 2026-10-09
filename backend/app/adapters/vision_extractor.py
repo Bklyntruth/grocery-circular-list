@@ -434,7 +434,12 @@ async def _extract_one_page(
     # ── FALLBACK: Gemini ─────────────────────────────────────────────────
     async with _SEMAPHORE:
         resp = None
-        for attempt in range(2):
+        # Free tier is ~10-15 requests/min, so a big circular (ShopRite: two
+        # overlapping weeks, ~50 pages) hits 429s. Back off and retry instead
+        # of dropping the page — a dropped page loses every deal on it.
+        rate_waits = [15, 30, 60]
+        errors = 0
+        while True:
             try:
                 resp = await http.post(
                     f"{_API_BASE}/{_MODEL}:generateContent",
@@ -443,17 +448,19 @@ async def _extract_one_page(
                     timeout=90,
                 )
                 if resp.status_code == 429:
-                    if attempt == 0:
-                        log.info("Gemini rate limit — retrying in 15s for %s", url)
-                        await asyncio.sleep(15)
+                    if rate_waits:
+                        wait = rate_waits.pop(0)
+                        log.info("Gemini rate limit — retrying in %ds for %s", wait, url)
+                        await asyncio.sleep(wait)
                         continue
-                    log.info("Gemini quota exhausted — using OCR result for %s", url)
+                    log.warning("Gemini quota exhausted — using OCR result for %s", url)
                     return ocr_deals
                 resp.raise_for_status()
                 break
             except Exception as exc:
-                log.warning("Gemini error for %s (attempt %d): %s", url, attempt + 1, exc)
-                if attempt == 0:
+                errors += 1
+                log.warning("Gemini error for %s (attempt %d): %s", url, errors, exc)
+                if errors < 2:
                     await asyncio.sleep(5)
                     continue
                 return ocr_deals
