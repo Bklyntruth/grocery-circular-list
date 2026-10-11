@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from . import locator, grocery_list
 from .adapters import email_imap
-from . import cache, rescan
+from . import cache, rescan, push
 from .adapters import registry as adapter_registry
 from .adapters import foodway, vision_extractor
 from .adapters.foodway import _img_store
@@ -467,6 +467,55 @@ async def start_rescan(
 def rescan_status(key: Optional[str] = Query(None), x_rescan_key: Optional[str] = Header(None)) -> dict:
     _require_rescan_key(key, x_rescan_key)
     return {"ok": True, **rescan.status()}
+
+
+# Lock-screen notifications (see push.py). Exposed publicly through the
+# Tailscale Funnel path /push so phones without Tailscale can subscribe.
+class PushSubscribe(BaseModel):
+    app: str
+    subscription: dict
+    hub_url: Optional[str] = None
+    label: str = ""
+
+
+class PushEndpoint(BaseModel):
+    endpoint: str
+
+
+@app.on_event("startup")
+async def _start_push_loop() -> None:
+    import asyncio
+    asyncio.get_running_loop().create_task(push.loop())
+
+
+@app.get("/api/push/key", summary="Public key the apps subscribe with")
+def push_key() -> dict:
+    return {"ok": True, "publicKey": push.public_key()}
+
+
+@app.post("/api/push/subscribe", summary="Register a phone for notifications")
+def push_subscribe(body: PushSubscribe) -> dict:
+    try:
+        return push.subscribe(body.app, body.subscription, body.hub_url, body.label)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/push/unsubscribe", summary="Stop notifications for a phone")
+def push_unsubscribe(body: PushEndpoint) -> dict:
+    return push.unsubscribe(body.endpoint)
+
+
+@app.post("/api/push/status", summary="Is this phone registered?")
+def push_status(body: PushEndpoint) -> dict:
+    return {"ok": True, "subscribed": push.is_subscribed(body.endpoint)}
+
+
+@app.post("/api/push/test", summary="Send a test notification to one phone")
+def push_test(body: PushEndpoint) -> dict:
+    if not push.is_subscribed(body.endpoint):
+        raise HTTPException(404, "This phone isn't registered")
+    return {"ok": push.test_send(body.endpoint)}
 
 
 @app.get("/api/cache/health", summary="Per-adapter cache status")

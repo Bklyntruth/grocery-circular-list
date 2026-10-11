@@ -5,3 +5,5 @@ pydantic>=2.6
 python-dotenv>=1.0
 python-multipart>=0.0.9
 pdfplumber>=0.11
+pywebpush>=2.0
+tzdata>=2024.1
