@@ -5,6 +5,14 @@ Flipp category fields) is unavailable.  First match wins — order matters.
 """
 
 _RULES: list[tuple[str, list[str]]] = [
+    # Checked first: names with a fruit, vegetable or meat word in them that
+    # aren't fresh produce or meat ("onion powder", "apple dips", "apple cider
+    # vinegar", "orange juice", "ground coffee").
+    ("Pantry", [
+        "powder", "seasoning", "spice", "dip", "hummus", "hommus", "salsa",
+        "vinegar", "oats", "oatmeal", "jelly", "jam",
+    ]),
+    ("Beverages", ["juice", "coffee"]),
     ("Produce", [
         "apple", "banana", "orange", "grape", "berry", "berries", "cherry",
         "cherries", "melon", "watermelon", "corn", "lettuce", "tomato",
@@ -13,7 +21,7 @@ _RULES: list[tuple[str, list[str]]] = [
         "salad", "blueberry", "strawberry", "lemon", "lime", "mango",
         "pineapple", "peach", "plum", "nectarine", "asparagus", "zucchini",
         "squash", "eggplant", "artichoke", "scallion", "radish", "leek",
-        "cabbage", "cauliflower", "beet", "yam", "sweet potato",
+        "cabbage", "cauliflower", "beet", "yam", "sweet potato", "kiwi",
         "california cherries", "fresh corn",
     ]),
     ("Seafood", [
@@ -25,7 +33,7 @@ _RULES: list[tuple[str, list[str]]] = [
     ]),
     ("Meat", [
         "beef", "chicken", "pork", "turkey", "lamb", "veal", "steak",
-        "ground", "chop", "rib", "roast", "brisket", "ham", "sausage",
+        "chop", "rib", "roast", "brisket", "ham", "sausage",
         "bacon", "hot dog", "burger", "cutlet", "breast", "thigh",
         "drumstick", "wing", "tenderloin", "loin", "sirloin", "flank",
         "chuck", "shoulder", "butt", "porterhouse", "t-bone", "strip steak",

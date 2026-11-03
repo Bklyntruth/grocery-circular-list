@@ -1,3 +1,4 @@
+import asyncio
 import re
 
 import httpx
@@ -42,6 +43,9 @@ FLIPP_API = "https://backflipp.wishabi.com/flipp"
 UA = "grocery-circular-list/0.1 (self-hosted)"
 
 _ZIP_RE = re.compile(r"\b(\d{5})\b")
+# Multi-buy: Flipp's pre_price_text is "2 FOR" or "2/" in front of the total.
+_MULTI_PREFIX = re.compile(r"^\s*(\d{1,2})\s*(?:for|/)\s*$", re.I)
+_WHOLE_DOLLAR = re.compile(r"^\d{1,3}(?:\.0+)?$")
 
 def _zip_from_address(address: str | None) -> str | None:
     if not address:
@@ -103,6 +107,36 @@ class FlippAdapter(CircularAdapter):
         data = r.json()
         return data.get("flyers", []) if isinstance(data, dict) else []
 
+    async def _multi_buy_prefixes(self, client: httpx.AsyncClient, raw_items: list[dict]) -> dict:
+        """Item id → quantity for multi-buy deals ("2 FOR $7").
+
+        The flyer listing only has the total (price "7.0"); the "2 FOR" part is
+        on each item's own page (pre_price_text). Multi-buy totals are whole
+        dollars, so only those items are looked up, 8 at a time. Any failure
+        just leaves that price as it was.
+        """
+        ids = [it.get("id") for it in raw_items
+               if it.get("id") and _WHOLE_DOLLAR.match(str(it.get("price") or ""))]
+        found: dict = {}
+        sem = asyncio.Semaphore(8)
+
+        async def one(item_id):
+            async with sem:
+                try:
+                    r = await client.get(f"{FLIPP_API}/items/{item_id}")
+                    if r.status_code != 200:
+                        return
+                    data = r.json() or {}
+                    pre = str((data.get("item") or data).get("pre_price_text") or "")
+                    m = _MULTI_PREFIX.match(pre)
+                    if m and int(m.group(1)) >= 2:
+                        found[item_id] = int(m.group(1))
+                except (httpx.HTTPError, ValueError):
+                    return
+
+        await asyncio.gather(*(one(i) for i in ids))
+        return found
+
     async def _fetch_flyer_items(self, client: httpx.AsyncClient, flyer: dict) -> list[CircularItem]:
         flyer_id = flyer.get("id")
         if not flyer_id:
@@ -113,6 +147,7 @@ class FlippAdapter(CircularAdapter):
         if r.status_code != 200:
             return []
         raw_items = (r.json() or {}).get("items", [])
+        multi = await self._multi_buy_prefixes(client, raw_items)
         out: list[CircularItem] = []
         for it in raw_items:
             name = (it.get("name") or "").strip()
@@ -120,6 +155,8 @@ class FlippAdapter(CircularAdapter):
                 continue
             raw_price = it.get("price")
             price = f"${raw_price}" if raw_price not in (None, "", 0) else None
+            if price and it.get("id") in multi:
+                price = f"{multi[it.get('id')]}/{price}"     # "2 FOR" + "$7.0" → "2/$7.0"
             sale_text = None
             for area in it.get("text_areas") or []:
                 if isinstance(area, dict) and (txt := (area.get("text") or "").strip()):
