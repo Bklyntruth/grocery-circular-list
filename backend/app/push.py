@@ -9,6 +9,8 @@ the Google Sheets the apps already use and sends what's due:
     - log-lunch reminder at the day's time, unless lunch is logged
     - no-workout nudge once a day when the last workout is N+ days old
     (schedule saved by the app in the Hub's Settings as `pushReminders`)
+    - problems the Hub noticed (a workout that didn't go on the calendar,
+      photo reading that stopped working), from Settings `alerts`, once each
 
   Pantry Portal (the family pantry sheet from rescan.json):
     - a new shipment arrived from the email scanner (Pending)
@@ -46,6 +48,7 @@ DB_PATH = DATA_DIR / "push.db"
 TZ = ZoneInfo(os.environ.get("PUSH_TZ", "America/New_York"))
 CHECK_EVERY_S = 5 * 60
 REMINDER_WINDOW = timedelta(hours=3)      # a reminder still goes out up to 3 h late (server restart), never later
+ALERT_FRESH = timedelta(hours=24)         # a Hub problem older than this is old news: Settings still lists it
 PANTRY_HOURS = (8, 21)                    # pantry alerts wait for daytime
 MAX_SUBSCRIPTIONS = 60
 APPS = {"power", "pantry"}
@@ -282,6 +285,21 @@ def power_due(now: datetime, data: dict) -> list[dict]:
     return out
 
 
+def power_alerts(now: datetime, data: dict) -> list[dict]:
+    """Problems the Hub listed in Settings as `alerts` (Hub 2026.11.04+): the
+    last day's, minus any it already showed as a Google Calendar pop-up."""
+    out = []
+    for a in _settings(data.get("settings", [])).get("alerts") or []:
+        if not isinstance(a, dict) or not a.get("id") or a.get("calendar"):
+            continue
+        when = _local(a.get("at"))
+        if not when or not now - ALERT_FRESH <= when <= now + timedelta(minutes=5):
+            continue
+        body = str(a.get("details") or "").split("\n\n")[0][:180]
+        out.append({"kind": f"alert:{a['id']}", "title": f"Power Tracker problem: {a.get('title') or 'something needs a look'}", "body": body})
+    return out
+
+
 # ── What's due: Pantry Portal ─────────────────────────────────────────
 def pantry_due(now: datetime, data: dict, workspace_id: str, first_run: bool) -> list[dict]:
     """New shipments and newly-low items. Marks what it has seen; on the very
@@ -363,6 +381,10 @@ async def check_once(client: httpx.AsyncClient, sender: Sender = webpush_send, n
             continue
         for n in power_due(now, data):
             if _once(f"power|{hub}|{n['kind']}|{now.date().isoformat()}"):
+                for s in subs:
+                    sent += send(s["endpoint"], s["sub"], {**n, "url": APP_URLS["power"], "tag": n["kind"]}, sender)
+        for n in power_alerts(now, data):         # each problem's id already includes its day
+            if _once(f"power|{hub}|{n['kind']}"):
                 for s in subs:
                     sent += send(s["endpoint"], s["sub"], {**n, "url": APP_URLS["power"], "tag": n["kind"]}, sender)
 

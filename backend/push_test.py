@@ -112,6 +112,22 @@ class PowerTracker(unittest.TestCase):
         self.assertEqual(self.kinds(at(0, 18, 5), last_workout_days=2), ["workoutGap"])
         self.assertEqual(self.kinds(at(0, 18, 5)), ["workoutGap"])                    # never worked out
 
+    def test_hub_problems_from_the_last_day_unless_already_a_calendar_popup(self):
+        now = at(0, 12)
+        alerts = [
+            {"id": "gemini-20261012", "kind": "gemini", "at": (now - timedelta(hours=1)).isoformat(), "title": "photo reading stopped working",
+             "details": "Google rejected the Gemini key.\n\nHow to fix it: …", "calendar": False},
+            {"id": "calendar-20261012", "kind": "calendar", "at": now.isoformat(), "title": "x", "details": "", "calendar": True},
+            {"id": "gemini-20261010", "kind": "gemini", "at": (now - timedelta(days=2)).isoformat(), "title": "old", "details": ""},
+        ]
+        d = hub_data(now=now, last_workout_days=0)
+        d["settings"].append({"key": "alerts", "value": json.dumps(alerts)})
+        out = push.power_alerts(now, d)
+        self.assertEqual([n["kind"] for n in out], ["alert:gemini-20261012"])
+        self.assertEqual(out[0]["title"], "Power Tracker problem: photo reading stopped working")
+        self.assertEqual(out[0]["body"], "Google rejected the Gemini key.")
+        self.assertEqual(push.power_alerts(now, hub_data(now=now)), [])            # no alerts setting at all
+
 
 def pantry_sheet(shipments=(), low=()):
     S = [["OrderID", "Vendor", "Order Date", "Status", "workspace_id"]] + [[o, "Melaleuca", "2026-10-10", "Pending", "ws1"] for o in shipments]
@@ -156,6 +172,16 @@ class Loop(unittest.TestCase):
         self.sent.clear()
         self.run_at(at(5, 9, 3))                      # Saturday's own reminder
         self.assertEqual(len(self.sent), 2)
+
+    def test_hub_problem_goes_to_every_phone_once(self):
+        push.subscribe("power", phone(1), HUB)
+        push.subscribe("power", phone(2, "web.push.apple.com"), HUB)
+        now = at(0, 12)                               # Monday noon: no reminder is due
+        self.hub["settings"].append({"key": "alerts", "value": json.dumps([{"id": "calendar-20261012", "kind": "calendar",
+            "at": now.isoformat(), "title": "a workout didn't go on your calendar", "details": "Saved, but…", "calendar": False}])})
+        self.run_at(now)
+        self.run_at(now + timedelta(minutes=5))       # next check: already sent
+        self.assertEqual([p["tag"] for _, p in self.sent], ["alert:calendar-20261012"] * 2)
 
     def test_pantry_first_check_is_quiet_then_new_things_alert(self):
         push.subscribe("pantry", phone(3))
