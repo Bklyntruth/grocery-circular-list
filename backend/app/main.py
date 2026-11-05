@@ -448,6 +448,16 @@ def _require_rescan_key(key: Optional[str], header_key: Optional[str]) -> None:
         raise HTTPException(403, "Invalid or missing rescan key")
 
 
+async def _rescan_fetch_all(z: str) -> list[Circular]:
+    return await get_all_circulars(location=z, radius_m=4800, postal_code=z, refresh=True)
+
+
+@app.on_event("startup")
+async def _start_rescan_schedule() -> None:
+    import asyncio
+    asyncio.get_running_loop().create_task(rescan.schedule_loop(_rescan_fetch_all))
+
+
 @app.post("/api/rescan", summary="Re-read every circular and write the deals to the pantry sheet")
 async def start_rescan(
     key: Optional[str] = Query(None),
@@ -455,11 +465,7 @@ async def start_rescan(
     x_rescan_key: Optional[str] = Header(None),
 ) -> dict:
     _require_rescan_key(key, x_rescan_key)
-
-    async def fetch_all(z: str) -> list[Circular]:
-        return await get_all_circulars(location=z, radius_m=4800, postal_code=z, refresh=True)
-
-    started = rescan.start(fetch_all, zip)
+    started = rescan.start(_rescan_fetch_all, zip)
     return {"ok": True, "started": started, **rescan.status()}
 
 

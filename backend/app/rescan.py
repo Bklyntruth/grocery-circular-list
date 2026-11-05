@@ -12,22 +12,44 @@ Config lives in DATA_DIR/rescan.json (bind-mounted, survives rebuilds):
     "sheets_url": "https://script.google.com/macros/s/.../exec",
     "workspace_id": "8417_avenue_j_0001",
     "zip": "11236",
-    "public_base": "https://byerway.<tailnet>.ts.net"   # for /img links
+    "public_base": "https://byerway.<tailnet>.ts.net",  # for /img links
+    "schedule": ["thu 22:00", "sat 22:00"]              # optional, see below
   }
+
+It also runs by itself on a schedule (schedule_loop, started with the
+server), and each run clears stores whose deals have all ended, so phones
+stop downloading last month's ads on every sync.
 """
 import asyncio
 import hmac
 import json
+import logging
 import os
+import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 CONFIG_PATH = DATA_DIR / "rescan.json"
+
+log = logging.getLogger("rescan")
+
+# Most nearby stores start a new ad on Friday (C-Town, Key Food, Foodway) or
+# Sunday (ShopRite), so by default the rescan runs the night before each:
+# Thursday and Saturday at 10 pm. "schedule" in rescan.json overrides it
+# ("off" turns it off). A run missed while the server was down still happens
+# within a day of its time.
+SCHEDULE_DEFAULT = ["thu 22:00", "sat 22:00"]
+SCHEDULE_STATE = DATA_DIR / "rescan_schedule.json"
+TZ = ZoneInfo(os.environ.get("PUSH_TZ", "America/New_York"))
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+SLOT = re.compile(r"^(mon|tue|wed|thu|fri|sat|sun)\s+(\d{1,2}):(\d{2})$")
+STALE_DAYS = 14     # an ad with no end date counts as over two weeks after its last fetch
 
 _state: dict = {"running": False, "started_at": None, "finished_at": None, "result": None, "error": None}
 
@@ -151,10 +173,27 @@ async def _run(fetch_all, zip_override: Optional[str]) -> None:
                                                  "circular": {k: ("" if v is None else v) for k, v in row.items()}})
                 updated.append({"store": name, "deals": len(deals)})
 
+            # Stores whose deals have all ended and that weren't refreshed just
+            # now: clear them (an empty replace), so every phone's next sync
+            # stops downloading expired ads.
+            r = await client.get(sheets_url, params={"action": "read", "sheet": "CircularDeals"})
+            r.raise_for_status()
+            now = datetime.now(TZ)
+            fresh = {u["store"].lower() for u in updated}
+            fetched = {str(dict(zip(headers, raw)).get("store_name") or "").strip().lower():
+                       dict(zip(headers, raw)).get("last_fetched") for raw in rows[1:]}
+            cleared = []
+            for name in expired_stores(r.json(), ws, now.date().isoformat(), fresh, fetched,
+                                       (now - timedelta(days=STALE_DAYS)).date().isoformat()):
+                await _post(client, sheets_url, {"action": "replace_store_deals", "store_name": name,
+                                                 "workspace_id": ws, "deals": []})
+                cleared.append(name)
+
         _state["result"] = {
             "zip": zip_code,
             "circulars": len(circulars),
             "stores_updated": updated,
+            "stores_cleared": cleared,
             "seconds": round(time.time() - t0, 1),
         }
     except Exception as e:  # reported through /api/rescan/status
@@ -162,3 +201,86 @@ async def _run(fetch_all, zip_override: Optional[str]) -> None:
     finally:
         _state["running"] = False
         _state["finished_at"] = _now()
+
+
+def expired_stores(rows, workspace_id: str, today: str, skip: set,
+                   fetched: Optional[dict] = None, stale_before: Optional[str] = None) -> list[str]:
+    """Stores in CircularDeals (a header row + rows) whose every deal has a
+    valid_to before `today` (YYYY-MM-DD). Some stores' ads carry no end date;
+    those count as ended once the store was last fetched before
+    `stale_before` (`fetched`: lower-case name -> last_fetched). Stores in
+    `skip` (lower-case, just refreshed) are left alone."""
+    if not isinstance(rows, list) or len(rows) < 2:
+        return []
+    hdr = [str(h) for h in rows[0]]
+    if "store_name" not in hdr or "valid_to" not in hdr:
+        return []
+    sn, vt = hdr.index("store_name"), hdr.index("valid_to")
+    wi = hdr.index("workspace_id") if "workspace_id" in hdr else None
+    latest: dict[str, Optional[str]] = {}
+    names: dict[str, str] = {}
+    for row in rows[1:]:
+        name = str(row[sn] if sn < len(row) else "").strip()
+        if not name:
+            continue
+        row_ws = str(row[wi] if wi is not None and wi < len(row) else "")
+        if workspace_id and row_ws and row_ws != workspace_id:
+            continue
+        key = name.lower()
+        names.setdefault(key, name)
+        end = str(row[vt] if vt < len(row) else "")[:10]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", end):
+            latest[key] = None          # no end date: never call this store expired
+        elif key not in latest:
+            latest[key] = end
+        elif latest[key] is not None:
+            latest[key] = max(latest[key], end)
+    def ended(k, end):
+        if end is not None:
+            return end < today
+        got = str((fetched or {}).get(k) or "")[:10]
+        return bool(stale_before) and bool(re.match(r"^\d{4}-\d{2}-\d{2}$", got)) and got < stale_before
+    return [names[k] for k, end in latest.items() if k not in skip and ended(k, end)]
+
+
+def due_slot(now: datetime, slots, done) -> Optional[str]:
+    """The scheduled run to start now, as its start time, or None.
+
+    A slot is due from its time until a day later, unless it already ran
+    (`done` holds the start times of runs already made)."""
+    for s in slots or []:
+        m = SLOT.match(str(s).strip().lower())
+        if not m:
+            continue
+        start = (now - timedelta(days=(now.weekday() - DAYS.index(m[1])) % 7)).replace(
+            hour=int(m[2]), minute=int(m[3]), second=0, microsecond=0)
+        if start > now:
+            start -= timedelta(days=7)
+        key = start.isoformat()
+        if now - start < timedelta(hours=24) and key not in done:
+            return key
+    return None
+
+
+def _done() -> list:
+    try:
+        return json.loads(SCHEDULE_STATE.read_text(encoding="utf-8")).get("done", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+async def schedule_loop(fetch_all: Callable[[str], Awaitable[list]], every_s: int = 300) -> None:
+    """Started with the server: every few minutes, start any rescan that's due."""
+    while True:
+        try:
+            cfg = load_config()
+            slots = cfg.get("schedule", SCHEDULE_DEFAULT)
+            if cfg.get("sheets_url") and cfg.get("zip") and slots != "off":
+                done = _done()
+                slot = due_slot(datetime.now(TZ), slots, done)
+                if slot and start(fetch_all):
+                    SCHEDULE_STATE.write_text(json.dumps({"done": (done + [slot])[-20:]}), encoding="utf-8")
+                    log.info("rescan: scheduled run for %s started", slot)
+        except Exception as e:  # never let a bad config stop the loop
+            log.warning("rescan schedule: %s", e)
+        await asyncio.sleep(every_s)
