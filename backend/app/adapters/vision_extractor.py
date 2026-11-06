@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -37,7 +38,11 @@ _ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 
 log = logging.getLogger(__name__)
 
-_MODEL = "gemini-2.5-flash"
+# Tried in order. New Google AI Studio projects get 404 "no longer available to
+# new users" for 2.5 Flash, so a key from a newer project used to read no
+# ShopRite prices at all; the others are what Power Tracker and Pantry
+# Portal's server fall back to (keep the three lists in the same order).
+_MODELS = ["gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
 _API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # One page at a time — focused, precise, no truncation risk.
@@ -61,10 +66,17 @@ _PROMPT = (
 # balances speed and rate-limit headroom for a 13-page circular.
 _SEMAPHORE = asyncio.Semaphore(5)
 
-# Set when Gemini reports the free tier's DAILY request limit is used up.
-# Waiting won't help until it resets, so skip Gemini (and its retry waits)
-# for an hour instead of stalling every remaining page for ~2 minutes.
-_gemini_daily_block_until = 0.0
+# model -> time it may be tried again. Set when Gemini reports that model's
+# DAILY free limit is used up (waiting won't help until it resets, so skip it
+# for an hour instead of stalling every remaining page for ~2 minutes), or that
+# this key can't use the model at all (404, skipped for 6 hours). Free limits
+# are per model, so the next model in _MODELS still gets its turn.
+_model_blocked_until: dict[str, float] = {}
+
+
+def _usable_models() -> list[str]:
+    now = time.time()
+    return [m for m in _MODELS if _model_blocked_until.get(m, 0.0) <= now]
 
 _cache: dict[str, list[dict]] = {}
 _cache_ts: dict[str, float] = {}   # NID → unix timestamp of last fill
@@ -389,6 +401,66 @@ async def _extract_page_ocr(url: str, http: httpx.AsyncClient) -> list[dict]:
     return [d for d in deals if _is_valid_deal(d)]
 
 
+async def _ask_gemini(http: httpx.AsyncClient, model: str, api_key: str,
+                      payload: dict, url: str) -> tuple[Optional[httpx.Response], str]:
+    """One model's go at one page: (response, "ok" | "next" | "stop").
+
+    "next": this model can't answer (not offered to this key, its daily free
+    limit is used up, or it stayed busy), so the caller tries the next model.
+    "stop": the key itself was refused, or the per-minute limit didn't clear
+    after backing off; another model won't do better, so keep the OCR result.
+    """
+    # Free tier is ~10-15 requests/min, so a big circular (ShopRite: two
+    # overlapping weeks, ~50 pages) hits 429s. Back off and retry instead
+    # of dropping the page — a dropped page loses every deal on it.
+    rate_waits = [15, 30, 60]
+    errors = 0
+    while True:
+        try:
+            resp = await http.post(
+                f"{_API_BASE}/{model}:generateContent",
+                params={"key": api_key},
+                json=payload,
+                timeout=90,
+            )
+        except Exception as exc:
+            errors += 1
+            log.warning("Gemini %s error for %s (attempt %d): %s", model, url, errors, exc)
+            if errors < 2:
+                await asyncio.sleep(5)
+                continue
+            return None, "next"
+        code = resp.status_code
+        if code == 200:
+            return resp, "ok"
+        if code == 429:
+            if "PerDay" in resp.text:
+                _model_blocked_until[model] = time.time() + 3600
+                log.warning("Gemini %s daily free-tier limit reached — skipping it for 1h", model)
+                return None, "next"
+            if rate_waits:
+                wait = rate_waits.pop(0)
+                log.info("Gemini rate limit — retrying in %ds for %s", wait, url)
+                await asyncio.sleep(wait)
+                continue
+            log.warning("Gemini quota exhausted — using OCR result for %s", url)
+            return None, "stop"
+        if code == 404:
+            _model_blocked_until[model] = time.time() + 6 * 3600
+            log.warning("Gemini %s isn't available to this key — trying the next model", model)
+            return None, "next"
+        if code >= 500:
+            errors += 1
+            log.warning("Gemini %s busy (HTTP %d) for %s (attempt %d)", model, code, url, errors)
+            if errors < 2:
+                await asyncio.sleep(5)
+                continue
+            return None, "next"
+        # 400 / 401 / 403: a bad or blocked key, or a page Gemini won't take.
+        log.warning("Gemini refused %s (HTTP %d): %s", url, code, resp.text[:160])
+        return None, "stop"
+
+
 async def _extract_one_page(
     url: str, http: httpx.AsyncClient, api_key: str
 ) -> list[dict]:
@@ -401,7 +473,6 @@ async def _extract_one_page(
     OCR.space first means no daily Gemini quota jams in normal use.
     Gemini steps in silently when OCR misses items on complex pages.
     """
-    global _gemini_daily_block_until
     # ── PRIMARY: OCR.space ───────────────────────────────────────────────
     ocr_deals = await _extract_page_ocr(url, http)
     if len(ocr_deals) >= 5:
@@ -411,9 +482,8 @@ async def _extract_one_page(
     # OCR returned too few — try Gemini for better structured extraction
     if not api_key:
         return ocr_deals  # no key configured, return what we have
-    import time
-    if time.time() < _gemini_daily_block_until:
-        return ocr_deals  # daily quota used up earlier in this run
+    if not _usable_models():
+        return ocr_deals  # every model's daily quota used up (or unavailable) earlier
 
     log.debug("OCR only got %d deals, trying Gemini for %s", len(ocr_deals), url)
 
@@ -443,39 +513,12 @@ async def _extract_one_page(
     # ── FALLBACK: Gemini ─────────────────────────────────────────────────
     async with _SEMAPHORE:
         resp = None
-        # Free tier is ~10-15 requests/min, so a big circular (ShopRite: two
-        # overlapping weeks, ~50 pages) hits 429s. Back off and retry instead
-        # of dropping the page — a dropped page loses every deal on it.
-        rate_waits = [15, 30, 60]
-        errors = 0
-        while True:
-            try:
-                resp = await http.post(
-                    f"{_API_BASE}/{_MODEL}:generateContent",
-                    params={"key": api_key},
-                    json=payload,
-                    timeout=90,
-                )
-                if resp.status_code == 429:
-                    if "PerDay" in resp.text:
-                        _gemini_daily_block_until = time.time() + 3600
-                        log.warning("Gemini daily free-tier limit reached — skipping Gemini for 1h")
-                        return ocr_deals
-                    if rate_waits:
-                        wait = rate_waits.pop(0)
-                        log.info("Gemini rate limit — retrying in %ds for %s", wait, url)
-                        await asyncio.sleep(wait)
-                        continue
-                    log.warning("Gemini quota exhausted — using OCR result for %s", url)
-                    return ocr_deals
-                resp.raise_for_status()
+        for model in _usable_models():
+            resp, verdict = await _ask_gemini(http, model, api_key, payload, url)
+            if verdict == "ok":
                 break
-            except Exception as exc:
-                errors += 1
-                log.warning("Gemini error for %s (attempt %d): %s", url, errors, exc)
-                if errors < 2:
-                    await asyncio.sleep(5)
-                    continue
+            resp = None
+            if verdict == "stop":         # the key was refused: another model won't help
                 return ocr_deals
         if resp is None:
             return ocr_deals
