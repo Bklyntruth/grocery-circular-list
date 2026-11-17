@@ -33,6 +33,7 @@ def reset():
         p = Path(TMP) / f
         if p.exists():
             p.unlink()
+    push._DEALS.update(at=0.0, rows=[])
 
 
 class Keys(unittest.TestCase):
@@ -129,12 +130,13 @@ class PowerTracker(unittest.TestCase):
         self.assertEqual(push.power_alerts(now, hub_data(now=now)), [])            # no alerts setting at all
 
 
-def pantry_sheet(shipments=(), low=()):
+def pantry_sheet(shipments=(), low=(), deals=()):
     S = [["OrderID", "Vendor", "Order Date", "Status", "workspace_id"]] + [[o, "Melaleuca", "2026-10-10", "Pending", "ws1"] for o in shipments]
     P = [["ProductID", "workspace_id", "name", "min_quantity"], ["p1", "ws1", "Tub Tea", 2], ["p2", "ws1", "Renew", 1], ["p3", "other", "Theirs", 5]]
     I = [["ProductID", "workspace_id", "Current Quantity"], ["p1", "ws1", 1 if "p1" in low else 6],
          ["p2", "ws1", 0 if "p2" in low else 4], ["p3", "other", 0]]
-    return {"Shipment": S, "Products": P, "Inventory": I}
+    D = [["store_name", "workspace_id", "product_name", "price", "valid_from", "valid_to"]] + [list(d) for d in deals]
+    return {"Shipment": S, "Products": P, "Inventory": I, "CircularDeals": D}
 
 
 class Loop(unittest.TestCase):
@@ -213,6 +215,94 @@ class Loop(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.run_at(at(1, 8, 1))
         self.assertEqual([p["tag"] for _, p in self.sent], ["shipment"])
+
+
+class PantryPhoneAlerts(Loop):
+    """Deal and expiry alerts per phone, from what each phone shared (POST /api/push/prefs)."""
+
+    SKIPPY = ("Key Food", "ws1", "Skippy Creamy Peanut Butter 16 oz", "$2.99", "2026-10-08", "2026-10-20")
+
+    def phone_with(self, n, **prefs):
+        push.subscribe("pantry", phone(n))
+        push.set_prefs(phone(n)["endpoint"], prefs)
+        return phone(n)["endpoint"]
+
+    def test_prefs_are_checked_and_kept_small(self):
+        with self.assertRaises(LookupError):
+            push.set_prefs("https://fcm.googleapis.com/fcm/send/nobody", {})
+        push.subscribe("power", phone(1), HUB)
+        with self.assertRaises(ValueError):
+            push.set_prefs(phone(1)["endpoint"], {})
+        push.subscribe("pantry", phone(2))
+        r = push.set_prefs(phone(2)["endpoint"], {
+            "categories": {"deal_alerts": False, "weekly_summary": True, "low_stock": 1},
+            "watch": [{"id": "b1", "name": " Skippy "}, {"id": "b2", "name": ""}, "junk"],
+            "expiring": [{"id": "m", "name": "Milk", "date": "2026-10-13"}, {"name": "Bad", "date": "soon"}],
+            "extra": "ignored"})
+        self.assertEqual(r, {"ok": True, "watch": 1, "expiring": 1})
+        sub = push._subs("pantry")[0]
+        self.assertEqual(sub["prefs"]["categories"], {"deal_alerts": False, "low_stock": True})
+        self.assertEqual(sub["prefs"]["watch"], [{"id": "b1", "name": "Skippy"}])
+        self.assertFalse(push._wants(sub, "deal_alerts"))
+        self.assertTrue(push._wants(sub, "expiration"), "a switch the phone didn't send stays on")
+
+    def test_a_watched_item_on_sale_comes_once_per_price(self):
+        self.pantry = pantry_sheet(shipments=["A1"], deals=[self.SKIPPY])
+        ep = self.phone_with(3, watch=[{"id": "b1", "name": "Skippy Peanut Butter"}])
+        self.run_at(at(0, 9))
+        self.assertEqual([(e, p["tag"]) for e, p in self.sent], [(ep, "deal")])
+        self.assertEqual(self.sent[0][1]["title"], "On sale: Skippy Peanut Butter")
+        self.assertIn("$2.99 at Key Food", self.sent[0][1]["body"])
+        self.assertTrue(self.sent[0][1]["url"].endswith("/watchlist"))
+        self.sent.clear()
+        self.run_at(at(0, 9, 5))                      # same price: already told
+        self.assertEqual(self.sent, [])
+        cheaper = self.SKIPPY[:3] + ("$2.49",) + self.SKIPPY[4:]
+        self.pantry = pantry_sheet(shipments=["A1"], deals=[cheaper])
+        push._DEALS["at"] = 0.0                      # (the server reads deals hourly)
+        self.run_at(at(0, 10))
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("$2.49", self.sent[0][1]["body"])
+
+    def test_deals_respect_the_switch_the_end_date_and_the_workspace(self):
+        ended = self.SKIPPY[:5] + ("2026-10-11",)
+        theirs = ("Key Food", "other", "Skippy Crunchy", "$1.99", "", "")
+        self.pantry = pantry_sheet(shipments=["A1"], deals=[ended, theirs])
+        self.phone_with(3, watch=[{"id": "b1", "name": "Skippy"}])
+        self.run_at(at(0, 9))
+        self.assertEqual(self.sent, [], "an ended sale and another pantry's deal don't count")
+        self.pantry = pantry_sheet(shipments=["A1"], deals=[self.SKIPPY])
+        push._DEALS["at"] = 0.0
+        push.set_prefs(phone(3)["endpoint"], {"categories": {"deal_alerts": False}, "watch": [{"id": "b1", "name": "Skippy"}]})
+        self.run_at(at(0, 10))
+        self.assertEqual(self.sent, [], "deal alerts turned off on this phone")
+
+    def test_expiring_items_from_the_phone_come_once(self):
+        ep = self.phone_with(4, expiring=[{"id": "m", "name": "Milk", "date": "2026-10-13"},
+                                          {"id": "y", "name": "Yogurt", "date": "2026-10-12"},
+                                          {"id": "o", "name": "Ancient", "date": "2026-09-01"},
+                                          {"id": "l", "name": "Later", "date": "2026-10-30"}])
+        self.run_at(at(0, 9))                         # Monday 2026-10-12
+        self.assertEqual([(e, p["tag"]) for e, p in self.sent], [(ep, "expiration")])
+        self.assertEqual(self.sent[0][1]["title"], "2 items expiring soon")
+        self.assertEqual(self.sent[0][1]["body"], "Yogurt (today), Milk (tomorrow)")
+        self.sent.clear()
+        self.run_at(at(0, 9, 5))
+        self.assertEqual(self.sent, [])
+        self.run_at(at(0, 22))                        # night: pantry alerts wait for daytime anyway
+        push.set_prefs(ep, {"categories": {"expiration": False},
+                            "expiring": [{"id": "b", "name": "Bread", "date": "2026-10-13"}]})
+        self.run_at(at(1, 9))
+        self.assertEqual(self.sent, [], "expiration warnings turned off on this phone")
+
+    def test_low_stock_follows_each_phones_switch(self):
+        self.phone_with(5)                            # shared nothing: gets it
+        self.phone_with(6, categories={"low_stock": False})
+        self.run_at(at(0, 9))                         # baseline
+        self.pantry = pantry_sheet(shipments=["A1", "B2"], low=["p1"])
+        self.run_at(at(0, 9, 5))
+        got = sorted((e.rsplit("/", 1)[1], p["tag"]) for e, p in self.sent)
+        self.assertEqual(got, [("phone5", "low"), ("phone5", "shipment"), ("phone6", "shipment")])
 
 
 if __name__ == "__main__":

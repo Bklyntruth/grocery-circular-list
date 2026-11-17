@@ -15,6 +15,11 @@ the Google Sheets the apps already use and sends what's due:
   Pantry Portal (the family pantry sheet from rescan.json):
     - a new shipment arrived from the email scanner (Pending)
     - pantry items dropping to their restock level
+    - a watched item on sale at a saved store (CircularDeals tab), once per price
+    - items expiring within 3 days (dates the phone shares: the sheet has none)
+    Each phone shares its alert switches, watchlist and upcoming expiry dates
+    (POST /api/push/prefs), so these come with the app closed, like Power
+    Tracker's reminders, and only the alerts that phone has turned on.
 
 Files in DATA_DIR (bind-mounted, survives rebuilds):
   push.json  VAPID keys, generated on first start (public key is served to
@@ -23,6 +28,7 @@ Files in DATA_DIR (bind-mounted, survives rebuilds):
 """
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -30,7 +36,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
@@ -57,6 +63,13 @@ PUSH_HOSTS = ("fcm.googleapis.com", "web.push.apple.com", "updates.push.services
               ".notify.windows.com", "push.services.mozilla.com")
 SCRIPT_URL_RE = re.compile(r"^https://script\.google\.com/macros/s/[A-Za-z0-9_-]+/exec$")
 DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]   # datetime.weekday() order
+PANTRY_CATEGORIES = ("deal_alerts", "low_stock", "expiration")   # the app's switch names the server honours
+MAX_WATCH = 300
+MAX_EXPIRING = 500
+EXPIRING_DAYS = 3                         # the app's own rule: within 3 days
+EXPIRED_GRACE_DAYS = 7                    # an item that expired longer ago than this is old news
+DEALS_EVERY_S = 3600                      # deals change twice a week: read the tab at most hourly
+_DEALS = {"at": 0.0, "rows": []}
 
 
 # ── Keys ──────────────────────────────────────────────────────────────
@@ -103,6 +116,8 @@ def db():
             hub_url text, label text, created_at text, fails integer default 0)""")
         con.execute("create table if not exists sent (key text primary key, at text)")
         con.execute("create table if not exists seen (kind text, item text, at text, primary key (kind, item))")
+        if "prefs" not in [r[1] for r in con.execute("pragma table_info(subs)")]:
+            con.execute("alter table subs add column prefs text")
         with con:
             yield con
     finally:
@@ -150,8 +165,57 @@ def is_subscribed(endpoint: str) -> bool:
 
 def _subs(app: str) -> list[dict]:
     with db() as con:
-        rows = con.execute("select endpoint, sub_json, hub_url from subs where app=?", (app,)).fetchall()
-    return [{"endpoint": e, "sub": json.loads(s), "hub_url": h} for e, s, h in rows]
+        rows = con.execute("select endpoint, sub_json, hub_url, prefs from subs where app=?", (app,)).fetchall()
+    out = []
+    for e, s, h, p in rows:
+        try:
+            prefs = json.loads(p) if p else {}
+        except json.JSONDecodeError:
+            prefs = {}
+        out.append({"endpoint": e, "sub": json.loads(s), "hub_url": h, "prefs": prefs})
+    return out
+
+
+def _clean_prefs(prefs) -> dict:
+    """What a Pantry Portal phone may share: its alert switches, its watchlist
+    (id + name), and items with an expiry date (id + name + YYYY-MM-DD)."""
+    if not isinstance(prefs, dict):
+        raise ValueError("prefs must be an object")
+    cats = prefs.get("categories") if isinstance(prefs.get("categories"), dict) else {}
+    out = {"categories": {k: bool(cats[k]) for k in PANTRY_CATEGORIES if k in cats}}
+    watch = []
+    for w in (prefs.get("watch") or [])[:MAX_WATCH]:
+        if isinstance(w, dict) and str(w.get("name") or "").strip():
+            watch.append({"id": str(w.get("id") or w["name"])[:80], "name": str(w["name"]).strip()[:120]})
+    out["watch"] = watch
+    expiring = []
+    for x in (prefs.get("expiring") or [])[:MAX_EXPIRING]:
+        if isinstance(x, dict) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(x.get("date") or "")[:10]):
+            expiring.append({"id": str(x.get("id") or x.get("name") or "")[:80], "name": str(x.get("name") or "Item").strip()[:120],
+                             "date": str(x["date"])[:10]})
+    out["expiring"] = expiring
+    return out
+
+
+def set_prefs(endpoint: str, prefs) -> dict:
+    clean = _clean_prefs(prefs)
+    with db() as con:
+        row = con.execute("select app from subs where endpoint=?", (endpoint,)).fetchone()
+        if not row:
+            raise LookupError("This phone isn't registered")
+        if row[0] != "pantry":
+            raise ValueError("only Pantry Portal shares alert settings")
+        con.execute("update subs set prefs=? where endpoint=?", (json.dumps(clean), endpoint))
+    return {"ok": True, "watch": len(clean["watch"]), "expiring": len(clean["expiring"])}
+
+
+def _wants(sub: dict, category: str) -> bool:
+    """A phone that never shared its switches gets everything (the app's defaults are on)."""
+    return (sub.get("prefs") or {}).get("categories", {}).get(category, True)
+
+
+def _tag(endpoint: str) -> str:
+    return hashlib.sha1(endpoint.encode()).hexdigest()[:12]
 
 
 def _once(key: str) -> bool:
@@ -348,6 +412,65 @@ def pantry_due(now: datetime, data: dict, workspace_id: str, first_run: bool) ->
     return out
 
 
+def _words(s: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", str(s or "").lower()).strip()
+
+
+def name_match(target: str, candidate: str) -> bool:
+    """The app's loose match (dealWatcher.fuzzyMatchName: "Skippy" finds
+    "Skippy Peanut Butter Smooth 16 oz"), plus: every word of the watched name
+    is in the deal ("Skippy Peanut Butter" finds "Skippy Creamy Peanut Butter")."""
+    a, b = _words(target), _words(candidate)
+    if not a or not b:
+        return False
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) < 4:
+        return False
+    if shorter[: -(-len(shorter) * 65 // 100)] in longer:
+        return True
+    want = [w for w in a.split() if len(w) >= 3]
+    have = set(b.split())
+    return len(want) >= 2 and all(w in have for w in want)
+
+
+def deal_matches(now: datetime, deals: list[dict], workspace_id: str, watch: list[dict]) -> list[dict]:
+    """Watched items on sale now at the saved stores: [{watch, store, product, price}]."""
+    today = now.date().isoformat()
+    out = []
+    for d in deals:
+        if str(d.get("workspace_id") or "") != workspace_id:
+            continue
+        valid_to = str(d.get("valid_to") or "")[:10]
+        if valid_to and valid_to < today:
+            continue
+        product = str(d.get("product_name") or "")
+        for w in watch:
+            if name_match(w["name"], product):
+                out.append({"watch": w, "store": str(d.get("store_name") or "a saved store"), "product": product,
+                            "price": str(d.get("price") or "").strip()})
+                break
+    return out
+
+
+def expiring_soon(now: datetime, expiring: list[dict]) -> list[tuple[dict, int]]:
+    """Shared items expiring within EXPIRING_DAYS (or expired in the last week): [(item, days)]."""
+    out = []
+    for x in expiring:
+        try:
+            days = (date.fromisoformat(x["date"]) - now.date()).days
+        except ValueError:
+            continue
+        if -EXPIRED_GRACE_DAYS <= days <= EXPIRING_DAYS:
+            out.append((x, days))
+    return sorted(out, key=lambda t: t[1])
+
+
+def _when(days: int) -> str:
+    if days < 0:
+        return f"expired {-days} day{'s' if days != -1 else ''} ago"
+    return "today" if days == 0 else "tomorrow" if days == 1 else f"in {days} days"
+
+
 def _seen(kind: str, item: str) -> bool:
     with db() as con:
         return con.execute("select 1 from seen where kind=? and item=?", (kind, item)).fetchone() is not None
@@ -377,7 +500,7 @@ async def check_once(client: httpx.AsyncClient, sender: Sender = webpush_send, n
             names = {"settings": "Settings", "weighins": "Weighins", "foods": "Foods", "sessions": "Sessions", "sets": "Sets"}
             data = {k: _rows(await _read(client, hub, v)) for k, v in names.items()}
         except Exception as e:  # one person's script being down shouldn't stop the rest
-            log.warning("push: reading hub failed: %s", e)
+            log.warning("push: reading hub failed: %r", e)
             continue
         for n in power_due(now, data):
             if _once(f"power|{hub}|{n['kind']}|{now.date().isoformat()}"):
@@ -392,17 +515,53 @@ async def check_once(client: httpx.AsyncClient, sender: Sender = webpush_send, n
     pantry_subs = _subs("pantry")
     cfg = rescan.load_config()
     if pantry_subs and cfg.get("sheets_url") and PANTRY_HOURS[0] <= now.hour < PANTRY_HOURS[1]:
+        ws = cfg.get("workspace_id") or ""
         try:
             names = {"shipments": "Shipment", "products": "Products", "inventory": "Inventory"}
             data = {k: _rows(await _read(client, cfg["sheets_url"], v)) for k, v in names.items()}
             first = _once("pantry|baseline")
-            for n in pantry_due(now, data, cfg.get("workspace_id") or "", first):
+            for n in pantry_due(now, data, ws, first):
                 if _once(f"pantry|{n['kind']}"):
                     url = APP_URLS["pantry"] + (n.get("path") or "")
                     for s in pantry_subs:
+                        if n["kind"].startswith("low:") and not _wants(s, "low_stock"):
+                            continue
                         sent += send(s["endpoint"], s["sub"], {**n, "url": url, "tag": n["kind"].split(":")[0]}, sender)
         except Exception as e:
-            log.warning("push: pantry check failed: %s", e)
+            log.warning("push: pantry check failed: %r", e)
+        # Watched items on sale: each phone's own watchlist, once per store and price.
+        watchers = [s for s in pantry_subs if (s.get("prefs") or {}).get("watch") and _wants(s, "deal_alerts")]
+        if watchers:
+            try:
+                if time.time() - _DEALS["at"] > DEALS_EVERY_S:
+                    _DEALS.update(rows=_rows(await _read(client, cfg["sheets_url"], "CircularDeals")), at=time.time())
+                deals = _DEALS["rows"]
+                for s in watchers:
+                    fresh = [m for m in deal_matches(now, deals, ws, s["prefs"]["watch"])
+                             if _once(f"pantry|deal|{_tag(s['endpoint'])}|{m['watch']['id']}|{m['store']}|{m['price'].lower()}")]
+                    if fresh:
+                        first_m = fresh[0]
+                        title = f"On sale: {first_m['watch']['name']}" if len(fresh) == 1 else f"{len(fresh)} watched items on sale"
+                        body = "; ".join(f"{m['product']} {m['price']} at {m['store']}".replace("  ", " ") for m in fresh[:3])
+                        if len(fresh) > 3:
+                            body += f" and {len(fresh) - 3} more"
+                        sent += send(s["endpoint"], s["sub"], {"title": title, "body": body[:200], "url": APP_URLS["pantry"] + "watchlist",
+                                                              "tag": "deal"}, sender)
+            except Exception as e:
+                log.warning("push: deal check failed: %r", e)
+        # Expiring soon: the dates this phone shared (the sheet has none), once per item and date.
+        for s in pantry_subs:
+            if not _wants(s, "expiration"):
+                continue
+            fresh = [(x, d) for x, d in expiring_soon(now, (s.get("prefs") or {}).get("expiring") or [])
+                     if _once(f"pantry|exp|{_tag(s['endpoint'])}|{x['id']}|{x['date']}")]
+            if fresh:
+                x, d = fresh[0]
+                title = (f"{x['name']} {'expired' if d < 0 else 'expiring soon'}" if len(fresh) == 1
+                         else f"{len(fresh)} items expiring soon")
+                body = ", ".join(f"{x['name']} ({_when(d)})" for x, d in fresh[:4]) + (f" and {len(fresh) - 4} more" if len(fresh) > 4 else "")
+                sent += send(s["endpoint"], s["sub"], {"title": title, "body": body[:200], "url": APP_URLS["pantry"] + "inventory",
+                                                      "tag": "expiration"}, sender)
     return {"sent": sent}
 
 

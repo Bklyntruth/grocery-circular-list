@@ -488,6 +488,11 @@ class PushEndpoint(BaseModel):
     endpoint: str
 
 
+class PushPrefs(BaseModel):
+    endpoint: str
+    prefs: dict
+
+
 @app.on_event("startup")
 async def _start_push_loop() -> None:
     import asyncio
@@ -515,6 +520,16 @@ def push_unsubscribe(body: PushEndpoint) -> dict:
 @app.post("/api/push/status", summary="Is this phone registered?")
 def push_status(body: PushEndpoint) -> dict:
     return {"ok": True, "subscribed": push.is_subscribed(body.endpoint)}
+
+
+@app.post("/api/push/prefs", summary="A Pantry Portal phone's alert switches, watchlist and expiry dates")
+def push_prefs(body: PushPrefs) -> dict:
+    try:
+        return push.set_prefs(body.endpoint, body.prefs)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/push/test", summary="Send a test notification to one phone")
