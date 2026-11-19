@@ -269,6 +269,33 @@ def send(endpoint: str, sub: dict, payload: dict, sender: Sender) -> bool:
     return status < 400
 
 
+# ── Rescan-failure alerts ─────────────────────────────────────────────
+# A scheduled rescan happens Thursday and Saturday at 10 pm; if it fails,
+# the family finds out next time someone opens Pantry Portal and the deals
+# are missing. This sends one lock-screen alert per failed slot (deduped
+# through _once) so somebody can retry the rescan in the morning.
+def handle_rescan_result(state: dict, slot: Optional[str], sender: Sender = webpush_send) -> int:
+    """Called by rescan.py after each run. Alerts pantry subs when a run
+    tagged with a schedule slot ends with an error. Manual /api/rescan runs
+    (slot is None) are silent — the caller sees them. Returns the number of
+    notifications sent."""
+    if not slot or not state.get("error"):
+        return 0
+    if not _once("rescan|failed|" + slot):
+        return 0
+    body = "Try again from Pantry Portal: " + str(state.get("error") or "")[:120]
+    sent = 0
+    for s in _subs("pantry"):
+        sent += send(s["endpoint"], s["sub"], {
+            "title": "Grocery rescan failed",
+            "body": body,
+            "url": APP_URLS["pantry"] + "grocery-circulars",
+            "tag": "rescan-failed",
+        }, sender)
+    log.info("rescan-failed alert sent to %d phones (slot=%s)", sent, slot)
+    return sent
+
+
 def test_send(endpoint: str, sender: Sender = webpush_send) -> bool:
     with db() as con:
         row = con.execute("select app, sub_json from subs where endpoint=?", (endpoint,)).fetchone()

@@ -305,5 +305,45 @@ class PantryPhoneAlerts(Loop):
         self.assertEqual(got, [("phone5", "low"), ("phone5", "shipment"), ("phone6", "shipment")])
 
 
+class RescanFailureAlert(unittest.TestCase):
+    """handle_rescan_result() sends a lock-screen alert to Pantry subs when a
+    SCHEDULED rescan ends with an error. Manual runs (slot None) are silent,
+    and each failed slot alerts at most once."""
+
+    def setUp(self):
+        reset()
+        push.subscribe("pantry", phone(1))
+        push.subscribe("pantry", phone(2, "web.push.apple.com"))
+        push.subscribe("power",  phone(3), HUB)   # Power subs must not get it
+        self.sent = []
+        self._sender = lambda s, p: self.sent.append((s["endpoint"], p)) or 201
+
+    def test_a_failed_scheduled_run_alerts_every_pantry_phone(self):
+        state = {"running": False, "error": "Gemini 503", "result": None}
+        self.assertEqual(push.handle_rescan_result(state, "2026-11-19T22:00:00-05:00", self._sender), 2)
+        self.assertEqual({e for e, _ in self.sent}, {phone(1)["endpoint"], phone(2, "web.push.apple.com")["endpoint"]})
+        for _, p in self.sent:
+            self.assertEqual(p["title"], "Grocery rescan failed")
+            self.assertEqual(p["tag"], "rescan-failed")
+            self.assertIn("grocery-circulars", p["url"])
+            self.assertIn("Gemini 503", p["body"])
+
+    def test_one_alert_per_slot(self):
+        state = {"error": "x"}
+        push.handle_rescan_result(state, "2026-11-19T22:00:00-05:00", self._sender)
+        self.sent.clear()
+        # Same slot called again: already seen.
+        self.assertEqual(push.handle_rescan_result(state, "2026-11-19T22:00:00-05:00", self._sender), 0)
+        self.assertEqual(self.sent, [])
+        # A new slot still alerts.
+        self.assertEqual(push.handle_rescan_result(state, "2026-11-22T22:00:00-05:00", self._sender), 2)
+
+    def test_manual_runs_and_successful_runs_are_silent(self):
+        self.assertEqual(push.handle_rescan_result({"error": "x"}, None, self._sender), 0, "manual run (no slot)")
+        self.assertEqual(push.handle_rescan_result({"result": {"stores_updated": []}}, "2026-11-19T22:00", self._sender), 0,
+                         "success — no error")
+        self.assertEqual(self.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

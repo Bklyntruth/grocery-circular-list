@@ -63,5 +63,50 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(rescan.expired_stores({"error": "x"}, "ws1", "2026-11-04", set()), [])
 
 
+class OnFinishHook(unittest.IsolatedAsyncioTestCase):
+    """The hook rescan.py calls after each _run(). Lets push.py send a
+    lock-screen alert when a scheduled rescan fails."""
+
+    def setUp(self):
+        self._prev_cb = rescan._on_finish
+        self._prev_state = dict(rescan._state)
+        rescan._state.update(running=False, started_at=None, finished_at=None, result=None, error=None)
+        rescan._state.pop("scheduled_slot", None)
+        self.calls = []
+        rescan.set_on_finish(lambda state, slot: self.calls.append((state, slot)))
+
+    def tearDown(self):
+        rescan.set_on_finish(self._prev_cb)
+        rescan._state.clear()
+        rescan._state.update(self._prev_state)
+
+    async def test_fires_after_a_run_with_the_state_and_slot(self):
+        # A failing fetch — the body of _run raises, the finally still fires.
+        async def boom(_zip):
+            raise RuntimeError("Gemini 503")
+        rescan._state["scheduled_slot"] = "2026-11-19T22:00:00-05:00"
+        # The real _run needs a config; without one the body raises early.
+        await rescan._run(boom, None)
+        self.assertEqual(len(self.calls), 1, "hook was not called")
+        state, slot = self.calls[0]
+        self.assertTrue(state.get("error"), "failing run should set an error")
+        self.assertEqual(slot, "2026-11-19T22:00:00-05:00", "the scheduled slot should pass through")
+        self.assertNotIn("scheduled_slot", rescan._state, "the slot should be cleared after a run")
+
+    async def test_manual_runs_pass_slot_none(self):
+        async def ok(_zip):
+            return []
+        # No slot set: a manual run like /api/rescan.
+        await rescan._run(ok, None)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIsNone(self.calls[0][1], "manual runs carry slot=None")
+
+    async def test_a_broken_hook_does_not_wedge_the_rescan(self):
+        rescan.set_on_finish(lambda state, slot: (_ for _ in ()).throw(RuntimeError("bad hook")))
+        async def ok(_zip):
+            return []
+        await rescan._run(ok, None)   # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,6 +53,17 @@ STALE_DAYS = 14     # an ad with no end date counts as over two weeks after its 
 
 _state: dict = {"running": False, "started_at": None, "finished_at": None, "result": None, "error": None}
 
+# Optional: set once at startup (see main.py). Called after every _run() with
+# (state_copy, scheduled_slot_or_none). Lets push.py send a lock-screen alert
+# when a scheduled rescan fails, without this module importing push (which
+# imports this one — a circular).
+_on_finish: Optional[Callable[[dict, Optional[str]], None]] = None
+
+
+def set_on_finish(cb: Optional[Callable[[dict, Optional[str]], None]]) -> None:
+    global _on_finish
+    _on_finish = cb
+
 
 def load_config() -> dict:
     try:
@@ -201,6 +212,12 @@ async def _run(fetch_all, zip_override: Optional[str]) -> None:
     finally:
         _state["running"] = False
         _state["finished_at"] = _now()
+        slot = _state.pop("scheduled_slot", None)
+        if _on_finish is not None:
+            try:
+                _on_finish(dict(_state), slot)
+            except Exception as e:  # a bad hook shouldn't wedge the rescan
+                log.warning("rescan on_finish: %s", e)
 
 
 def expired_stores(rows, workspace_id: str, today: str, skip: set,
@@ -278,9 +295,14 @@ async def schedule_loop(fetch_all: Callable[[str], Awaitable[list]], every_s: in
             if cfg.get("sheets_url") and cfg.get("zip") and slots != "off":
                 done = _done()
                 slot = due_slot(datetime.now(TZ), slots, done)
-                if slot and start(fetch_all):
-                    SCHEDULE_STATE.write_text(json.dumps({"done": (done + [slot])[-20:]}), encoding="utf-8")
-                    log.info("rescan: scheduled run for %s started", slot)
+                if slot and not _state["running"]:
+                    # Tag this run as scheduled so _on_finish knows to alert.
+                    _state["scheduled_slot"] = slot
+                    if start(fetch_all):
+                        SCHEDULE_STATE.write_text(json.dumps({"done": (done + [slot])[-20:]}), encoding="utf-8")
+                        log.info("rescan: scheduled run for %s started", slot)
+                    else:
+                        _state.pop("scheduled_slot", None)
         except Exception as e:  # never let a bad config stop the loop
             log.warning("rescan schedule: %s", e)
         await asyncio.sleep(every_s)

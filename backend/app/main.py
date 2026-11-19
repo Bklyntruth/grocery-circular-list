@@ -455,6 +455,8 @@ async def _rescan_fetch_all(z: str) -> list[Circular]:
 @app.on_event("startup")
 async def _start_rescan_schedule() -> None:
     import asyncio
+    # When a scheduled rescan fails, Pantry phones get a lock-screen alert.
+    rescan.set_on_finish(push.handle_rescan_result)
     asyncio.get_running_loop().create_task(rescan.schedule_loop(_rescan_fetch_all))
 
 
