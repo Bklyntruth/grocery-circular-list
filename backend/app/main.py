@@ -166,9 +166,11 @@ async def pantry_low() -> Response:
 
 
 @app.get("/api/pantry/find", response_class=Response)
-async def pantry_find(q: str = Query(..., min_length=1, max_length=120)) -> Response:
+async def pantry_find(q: str = Query("", max_length=120)) -> Response:
     """Live circular deals matching a search term, cheapest first. Used by
-    'pantry find tuna' and the byerhub pantry-find button."""
+    'pantry-find tuna' and the byerhub pantry-find button. With no q, lists
+    the cheapest live deals overall so a tapped-without-typing button is
+    still useful."""
     text = pantry_view.find_text(await _pantry_rows("CircularDeals"),
                                  datetime.now().date().isoformat(), q)
     return Response(content=text + "\n", media_type="text/plain")

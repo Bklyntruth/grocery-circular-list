@@ -59,14 +59,17 @@ def _price_cents(price: str) -> int:
 
 
 def find_text(deals: list[dict], today: str, query: str, limit: int = 10) -> str:
-    """Live deals whose product_name shares a word with `query`, sorted by
-    cheapest first. Returns a short readable summary so a phone or P³
-    bubble can show it as-is."""
+    """Live deals sorted cheapest first. With `query`, only deals whose
+    product_name shares a real word with it; without, the cheapest deals
+    across every store. A short, readable summary for a phone or P³ bubble.
+
+    The no-query path makes a tapped button useful: P³'s shortlist tap
+    doesn't fill tool params (only the model rung does), so tapping
+    "Find the best price on something" without typing a question still
+    shows what's cheap this week instead of an error."""
     import re
     q_words = {w for w in re.findall(r"[a-z0-9]+", (query or "").lower())
                if len(w) >= 3}
-    if not q_words:
-        return 'Say what to search for, like "any deals on tuna?" or "best price on soda".'
     live = [d for d in deals
             if not str(d.get("valid_to") or "")[:10] or str(d.get("valid_to"))[:10] >= today]
     hits = []
@@ -74,20 +77,28 @@ def find_text(deals: list[dict], today: str, query: str, limit: int = 10) -> str
         name = str(d.get("product_name") or "").strip()
         if not name:
             continue
-        name_words = set(re.findall(r"[a-z0-9]+", name.lower()))
-        if not q_words & name_words:
-            continue
+        if q_words:
+            name_words = set(re.findall(r"[a-z0-9]+", name.lower()))
+            if not q_words & name_words:
+                continue
         cents = _price_cents(d.get("price"))
         hits.append((cents, name, str(d.get("store_name") or "").strip(),
                      str(d.get("price") or "").strip()))
     if not hits:
-        return f"No live deals found for {query!r}. Try rescanning or a shorter word."
+        if q_words:
+            return (f"No live deals found for {query!r}. Try rescanning or a shorter word.")
+        return "No live circular deals right now — try a rescan."
     hits.sort(key=lambda t: (t[0], t[1].lower()))
     best_c, best_name, best_store, best_price = hits[0]
-    good = sum(1 for c, *_ in hits if c < 10 ** 9)
-    lead = (f"Best price for {query}: {best_price} at {best_store} ({best_name})"
-            if best_c < 10 ** 9 and good
-            else f"{len(hits)} match{'es' if len(hits) != 1 else ''} for {query!r}:")
+    has_price = any(c < 10 ** 9 for c, *_ in hits)
+    if q_words and has_price:
+        lead = f"Best price for {query}: {best_price} at {best_store} ({best_name})"
+    elif q_words:
+        lead = f"{len(hits)} match{'es' if len(hits) != 1 else ''} for {query!r}:"
+    else:
+        lead = (f"Cheapest {min(len(hits), limit)} live deal"
+                f"{'s' if min(len(hits), limit) != 1 else ''} "
+                f"(say \"any deals on tuna?\" or similar to filter):")
     lines = [lead]
     for cents, name, store, price in hits[:limit]:
         lines.append(f"  {price:>8}  {store:<18}  {name}")

@@ -145,9 +145,17 @@ class FindDeals(unittest.TestCase):
         out = _pantry_find_text(self.DEALS, self.TODAY, "pepsi")
         self.assertIn("No live deals found", out)
 
-    def test_short_or_empty_query_asks_for_more(self):
-        self.assertIn("Say what to search for", _pantry_find_text(self.DEALS, self.TODAY, ""))
-        self.assertIn("Say what to search for", _pantry_find_text(self.DEALS, self.TODAY, "a b"))
+    def test_no_query_returns_cheapest_live_overall(self):
+        """A tap on the button without typing: show what's cheap this week,
+        not an error. P³'s shortlist taps don't fill tool params."""
+        for q in ("", "a b"):
+            out = _pantry_find_text(self.DEALS, self.TODAY, q)
+            self.assertIn("Cheapest", out, q)
+            self.assertIn("say \"any deals on tuna?\"", out, q)
+            # Still sorted cheapest first; tuna 4/$5 beats Coca-Cola $4.99.
+            lines = [l for l in out.splitlines() if l.startswith("  ")]
+            self.assertIn("C-Town", lines[0])
+            self.assertIn("Chicken of the Sea Tuna", lines[0])
 
     def test_nothing_found_says_so(self):
         out = _pantry_find_text(self.DEALS, self.TODAY, "kumquat")
