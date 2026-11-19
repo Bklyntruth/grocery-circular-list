@@ -15,7 +15,7 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import locator, grocery_list
+from . import locator, grocery_list, pantry_view
 from .adapters import email_imap
 from . import cache, rescan, push
 from .adapters import registry as adapter_registry
@@ -127,6 +127,59 @@ FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True}
+
+
+# ── Read-only pantry summaries, for /usr/local/bin/pantry and byerhub ─
+# Plain text so a terminal, a byerhub tool, or P³ can show it straight.
+# Reads the same pantry sheet the Grocery Server already writes to.
+async def _pantry_rows(sheet: str) -> list[dict]:
+    import httpx
+    cfg = rescan.load_config()
+    url = cfg.get("sheets_url") or ""
+    ws = cfg.get("workspace_id") or ""
+    if not url:
+        raise HTTPException(503, "pantry sheet is not configured yet")
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+        r = await c.get(url, params={"action": "read", "sheet": sheet})
+        r.raise_for_status()
+        rows = r.json()
+    if not isinstance(rows, list) or len(rows) < 1:
+        return []
+    hdr = [str(h) for h in rows[0]]
+    out = []
+    for raw in rows[1:]:
+        row = dict(zip(hdr, raw))
+        if ws and str(row.get("workspace_id") or "") not in ("", ws):
+            continue
+        out.append(row)
+    return out
+
+
+@app.get("/api/pantry/low", response_class=Response)
+async def pantry_low() -> Response:
+    """Items at or below their restock level — the same list Pantry Portal
+    highlights on Home. Plain text so terminals and P³ can show it as-is."""
+    text = pantry_view.low_text(await _pantry_rows("Products"), await _pantry_rows("Inventory"))
+    return Response(content=text + "\n", media_type="text/plain")
+
+
+@app.get("/api/pantry/deals", response_class=Response)
+async def pantry_deals() -> Response:
+    """This week's circular deals, grouped by store. Reads CircularDeals,
+    which the scheduled rescan fills."""
+    text = pantry_view.deals_text(await _pantry_rows("CircularDeals"),
+                                  datetime.now().date().isoformat())
+    return Response(content=text + "\n", media_type="text/plain")
+
+
+@app.get("/api/pantry/summary", response_class=Response)
+async def pantry_summary() -> Response:
+    """Low-stock + live deal count, in one short reply (two lines)."""
+    today = datetime.now().date().isoformat()
+    low = pantry_view.low_text(await _pantry_rows("Products"), await _pantry_rows("Inventory"))
+    deals = pantry_view.deals_text(await _pantry_rows("CircularDeals"), today)
+    return Response(content=low.split("\n", 1)[0] + "\n" + deals.split("\n", 1)[0] + "\n",
+                    media_type="text/plain")
 
 
 @app.get("/api/img/{key}")
