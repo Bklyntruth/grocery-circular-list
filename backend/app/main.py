@@ -165,6 +165,15 @@ async def pantry_low() -> Response:
     return Response(content=text + "\n", media_type="text/plain")
 
 
+@app.get("/api/pantry/find", response_class=Response)
+async def pantry_find(q: str = Query(..., min_length=1, max_length=120)) -> Response:
+    """Live circular deals matching a search term, cheapest first. Used by
+    'pantry find tuna' and the byerhub pantry-find button."""
+    text = pantry_view.find_text(await _pantry_rows("CircularDeals"),
+                                 datetime.now().date().isoformat(), q)
+    return Response(content=text + "\n", media_type="text/plain")
+
+
 @app.get("/api/pantry/deals", response_class=Response)
 async def pantry_deals() -> Response:
     """This week's circular deals, grouped by store. Reads CircularDeals,

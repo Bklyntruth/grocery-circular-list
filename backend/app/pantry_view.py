@@ -42,6 +42,60 @@ def low_text(products: list[dict], inventory: list[dict], limit: int = 40) -> st
     return "\n".join(lines)
 
 
+def _price_cents(price: str) -> int:
+    """Parse "$2.99", "2/$5", "3 for $5" to cents per unit. Returns a very
+    large number when a price can't be read, so bad entries sort last."""
+    import re
+    s = str(price or "").strip().lower()
+    if not s:
+        return 10 ** 9
+    # "2/$5" or "3 for $5" — per unit price.
+    m = re.search(r"(\d+)\s*(?:/|for)\s*\$?\s*(\d+(?:\.\d+)?)", s)
+    if m:
+        n, total = int(m.group(1)), float(m.group(2))
+        return int(round(total * 100 / n)) if n else 10 ** 9
+    m = re.search(r"\$?\s*(\d+(?:\.\d+)?)", s)
+    return int(round(float(m.group(1)) * 100)) if m else 10 ** 9
+
+
+def find_text(deals: list[dict], today: str, query: str, limit: int = 10) -> str:
+    """Live deals whose product_name shares a word with `query`, sorted by
+    cheapest first. Returns a short readable summary so a phone or P³
+    bubble can show it as-is."""
+    import re
+    q_words = {w for w in re.findall(r"[a-z0-9]+", (query or "").lower())
+               if len(w) >= 3}
+    if not q_words:
+        return 'Say what to search for, like "any deals on tuna?" or "best price on soda".'
+    live = [d for d in deals
+            if not str(d.get("valid_to") or "")[:10] or str(d.get("valid_to"))[:10] >= today]
+    hits = []
+    for d in live:
+        name = str(d.get("product_name") or "").strip()
+        if not name:
+            continue
+        name_words = set(re.findall(r"[a-z0-9]+", name.lower()))
+        if not q_words & name_words:
+            continue
+        cents = _price_cents(d.get("price"))
+        hits.append((cents, name, str(d.get("store_name") or "").strip(),
+                     str(d.get("price") or "").strip()))
+    if not hits:
+        return f"No live deals found for {query!r}. Try rescanning or a shorter word."
+    hits.sort(key=lambda t: (t[0], t[1].lower()))
+    best_c, best_name, best_store, best_price = hits[0]
+    good = sum(1 for c, *_ in hits if c < 10 ** 9)
+    lead = (f"Best price for {query}: {best_price} at {best_store} ({best_name})"
+            if best_c < 10 ** 9 and good
+            else f"{len(hits)} match{'es' if len(hits) != 1 else ''} for {query!r}:")
+    lines = [lead]
+    for cents, name, store, price in hits[:limit]:
+        lines.append(f"  {price:>8}  {store:<18}  {name}")
+    if len(hits) > limit:
+        lines.append(f"  ... and {len(hits) - limit} more")
+    return "\n".join(lines)
+
+
 def deals_text(deals: list[dict], today: str) -> str:
     """Live circular deals grouped by store, biggest first. A deal with no
     end date counts as live; one that ended before `today` (YYYY-MM-DD) is

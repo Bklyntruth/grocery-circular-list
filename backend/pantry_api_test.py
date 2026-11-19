@@ -6,6 +6,8 @@ import unittest
 
 from backend.app.pantry_view import low_text as _pantry_low_text
 from backend.app.pantry_view import deals_text as _pantry_deals_text
+from backend.app.pantry_view import find_text as _pantry_find_text
+from backend.app.pantry_view import _price_cents
 
 
 def p(pid, name, minq):
@@ -16,8 +18,8 @@ def inv(pid, qty):
     return {"ProductID": pid, "Current Quantity": qty}
 
 
-def deal(store, valid_to):
-    return {"store_name": store, "valid_to": valid_to}
+def deal(store, valid_to, name="", price=""):
+    return {"store_name": store, "valid_to": valid_to, "product_name": name, "price": price}
 
 
 class LowStock(unittest.TestCase):
@@ -96,6 +98,66 @@ class LiveDeals(unittest.TestCase):
     def test_a_deal_without_a_store_is_dropped(self):
         self.assertEqual(_pantry_deals_text([deal("", "2026-12-01")], "2026-11-18"),
                          "No live circular deals right now — try a rescan.")
+
+
+class PriceParsing(unittest.TestCase):
+    def test_reads_common_shapes(self):
+        self.assertEqual(_price_cents("$2.99"), 299)
+        self.assertEqual(_price_cents("2.99"), 299)
+        self.assertEqual(_price_cents("2/$5"), 250)
+        self.assertEqual(_price_cents("3 for $5"), 167)
+        self.assertEqual(_price_cents("10/$10"), 100)
+
+    def test_junk_sorts_last(self):
+        self.assertEqual(_price_cents(""), 10 ** 9)
+        self.assertEqual(_price_cents("call for price"), 10 ** 9)
+        self.assertEqual(_price_cents(None), 10 ** 9)
+
+
+class FindDeals(unittest.TestCase):
+    TODAY = "2026-11-18"
+    DEALS = [
+        deal("ShopRite", "2026-11-22", "Bumble Bee Tuna Chunk Light 5oz", "$1.29"),
+        deal("C-Town",   "2026-11-22", "Chicken of the Sea Tuna 5oz",     "4/$5"),
+        deal("Key Food", "2026-11-22", "StarKist Tuna 5oz",                "$1.49"),
+        deal("Foodway",  "2026-11-22", "Cheetos Crunchy 8.5oz",            "$3.99"),
+        deal("ShopRite", "2026-11-22", "Coca-Cola 12pk",                   "2/$10"),
+        deal("C-Town",   "2026-11-22", "Coca-Cola 12pk cans",              "$4.99"),
+        deal("Key Food", "2026-11-17", "Pepsi 12pk",                       "$5.99"),  # expired
+    ]
+
+    def test_finds_matching_deals_cheapest_first(self):
+        out = _pantry_find_text(self.DEALS, self.TODAY, "tuna")
+        self.assertIn("Best price for tuna: 4/$5 at C-Town", out)
+        lines = [l for l in out.splitlines() if l.startswith("  ")]
+        self.assertEqual(len(lines), 3, "three live tuna deals")
+        # First listed row is the cheapest.
+        self.assertIn("C-Town", lines[0])
+        self.assertIn("ShopRite", lines[1])
+        self.assertIn("Key Food", lines[2])
+
+    def test_parses_multi_for_prices(self):
+        out = _pantry_find_text(self.DEALS, self.TODAY, "coca-cola")
+        # 2/$10 = $5.00; $4.99 < $5.00, so C-Town wins.
+        self.assertIn("Best price for coca-cola: $4.99 at C-Town", out)
+
+    def test_expired_deals_dropped(self):
+        out = _pantry_find_text(self.DEALS, self.TODAY, "pepsi")
+        self.assertIn("No live deals found", out)
+
+    def test_short_or_empty_query_asks_for_more(self):
+        self.assertIn("Say what to search for", _pantry_find_text(self.DEALS, self.TODAY, ""))
+        self.assertIn("Say what to search for", _pantry_find_text(self.DEALS, self.TODAY, "a b"))
+
+    def test_nothing_found_says_so(self):
+        out = _pantry_find_text(self.DEALS, self.TODAY, "kumquat")
+        self.assertIn("No live deals found for 'kumquat'", out)
+
+    def test_long_result_is_truncated(self):
+        many = [deal("Store%d" % i, "2026-12-01", "Tuna %d" % i, "$%d.00" % (i + 1))
+                for i in range(20)]
+        out = _pantry_find_text(many, self.TODAY, "tuna", limit=5)
+        self.assertIn("... and 15 more", out)
 
 
 if __name__ == "__main__":
