@@ -6,27 +6,31 @@ wrappers that read the rows from Google Sheets and hand them to these."""
 
 
 def low_text(products: list[dict], inventory: list[dict], limit: int = 40) -> str:
-    """What Pantry Portal highlights on Home: products with a restock level,
-    whose on-hand quantity is at or below it. Sorted by name; a long list
-    is capped with a '... and N more' line."""
-    qty: dict[str, float] = {}
-    for inv in inventory:
-        try:
-            qty[str(inv.get("ProductID"))] = float(inv.get("Current Quantity") or 0)
-        except (TypeError, ValueError):
-            pass
+    """What Pantry Portal highlights on Home: products with an inventory row
+    AND a restock level, whose on-hand quantity is at or below that level.
+    Sorted by name; a long list is capped with a '... and N more' line.
+
+    Walking Inventory (not Products) is what the app does, and it matters:
+    there are hundreds of stale catalog entries with no stock row. Treating
+    those as 'zero on hand' used to report 440 low items on a household
+    that really has a few dozen."""
+    by_pid = {str(p.get("ProductID")): p for p in products}
     low: list[tuple[str, float, float]] = []
-    for p in products:
+    for inv in inventory:
+        pid = str(inv.get("ProductID"))
+        p = by_pid.get(pid)
+        if not p:
+            continue
         try:
+            qty = float(inv.get("Current Quantity") or 0)
             minq = float(p.get("min_quantity") or 0)
         except (TypeError, ValueError):
             continue
         if minq <= 0:
             continue
-        q = qty.get(str(p.get("ProductID")), 0.0)
-        if q <= minq:
+        if qty <= minq:
             name = str(p.get("name") or "Item").strip()
-            low.append((name, q, minq))
+            low.append((name, qty, minq))
     if not low:
         return "Nothing is at its restock level right now."
     low.sort(key=lambda t: t[0].lower())

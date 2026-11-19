@@ -24,7 +24,7 @@ class LowStock(unittest.TestCase):
     def test_lists_items_at_or_below_their_restock_level(self):
         products = [p("1", "Peanut Butter", 2), p("2", "Oats", 3), p("3", "Rice", 5),
                     p("4", "No Threshold Item", 0)]
-        inventory = [inv("1", 0), inv("2", 3), inv("3", 10)]
+        inventory = [inv("1", 0), inv("2", 3), inv("3", 10), inv("4", 0)]
         out = _pantry_low_text(products, inventory)
         self.assertIn("2 items at or below the restock level:", out)
         self.assertIn("Oats (3 of 3)", out)
@@ -32,9 +32,15 @@ class LowStock(unittest.TestCase):
         self.assertNotIn("Rice", out)
         self.assertNotIn("No Threshold Item", out)
 
-    def test_no_restock_level_or_no_inventory_row_counts_as_zero_on_hand(self):
-        products = [p("1", "Flour", 2)]
-        self.assertIn("Flour (0 of 2)", _pantry_low_text(products, []))
+    def test_catalog_entries_with_no_inventory_row_are_ignored(self):
+        """The household's real pantry: 440 catalog entries, 30 stocked.
+        Only the 30 with an actual inventory row should be considered."""
+        products = [p(str(i), f"Item {i:03d}", 1) for i in range(440)]
+        # Only pid "5" and "6" have a stock row; both are empty.
+        inventory = [inv("5", 0), inv("6", 0)]
+        out = _pantry_low_text(products, inventory)
+        self.assertIn("2 items at or below", out)
+        self.assertNotIn("Item 000", out, "pid 0 is not in Inventory, so not reported")
 
     def test_singular_plural(self):
         self.assertIn("1 item at or below", _pantry_low_text([p("1", "Milk", 1)], [inv("1", 0)]))
@@ -45,7 +51,7 @@ class LowStock(unittest.TestCase):
 
     def test_sorted_alphabetically(self):
         products = [p("1", "Zebra Bars", 1), p("2", "Apples", 1), p("3", "milk", 1)]
-        out = _pantry_low_text(products, [])
+        out = _pantry_low_text(products, [inv("1", 0), inv("2", 0), inv("3", 0)])
         a = out.index("Apples")
         m = out.index("milk")
         z = out.index("Zebra Bars")
@@ -60,7 +66,8 @@ class LowStock(unittest.TestCase):
 
     def test_long_list_is_truncated_with_a_count(self):
         products = [p(str(i), f"Item {i:03d}", 1) for i in range(60)]
-        out = _pantry_low_text(products, [], limit=10)
+        inventory = [inv(str(i), 0) for i in range(60)]
+        out = _pantry_low_text(products, inventory, limit=10)
         self.assertIn("60 items at or below", out)
         self.assertIn("... and 50 more", out)
         self.assertEqual(out.count("\n"), 11, "header + 10 items + the '... more' line")

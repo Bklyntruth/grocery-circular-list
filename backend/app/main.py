@@ -139,7 +139,9 @@ async def _pantry_rows(sheet: str) -> list[dict]:
     ws = cfg.get("workspace_id") or ""
     if not url:
         raise HTTPException(503, "pantry sheet is not configured yet")
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+    # CircularDeals has thousands of rows after a rescan; Apps Script was
+    # finishing the read in ~80 s, blowing a 60 s cap. 120 s matches rescan.
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
         r = await c.get(url, params={"action": "read", "sheet": sheet})
         r.raise_for_status()
         rows = r.json()
